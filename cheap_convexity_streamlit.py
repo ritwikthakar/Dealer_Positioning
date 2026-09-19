@@ -79,6 +79,37 @@ def score(d,w):
     d["regime"]="NO EDGE"; d.loc[cheap,"regime"]="CONVEXITY"; d.loc[cheap&low,"regime"]="CHEAP CONVEXITY"; d.loc[deep&low,"regime"]="DEEP CHEAP CONVEXITY"; d.loc[d["iv_hv"]>=1.15,"regime"]="THETA / EXPENSIVE IV"
     d["setup"]=np.select([deep&low&rising,deep&low,cheap&rising,cheap],
       ["HV > IV + historically cheap + IV turning up","HV > IV + historically cheap","HV > IV + IV turning up","HV > IV"],default="No long-convexity trigger")
+
+    # Best Expression Engine. This deliberately chooses structure, NOT direction.
+    # Strong acceleration + deeply underpriced vol favors uncapped convexity.
+    strong_accel = d["acceleration_score"] >= 70
+    liquid = d["liquidity_score"] >= 35
+    compressed = d["acceleration_score"] <= 45
+    expensive = d["iv_hv"] >= 1.15
+    hist_cheap = low
+
+    d["best_expression"] = "WAIT"
+    d["expression_reason"] = "No sufficiently clear volatility edge"
+
+    m = deep & hist_cheap & strong_accel & liquid
+    d.loc[m, "best_expression"] = "LONG OPTION / BACKSPREAD"
+    d.loc[m, "expression_reason"] = "Deeply cheap IV vs HV + historically cheap vol + strong repricing; preserve convexity"
+
+    m = cheap & ~strong_accel & liquid
+    d.loc[m, "best_expression"] = "DIRECTIONAL OTM CALENDAR"
+    d.loc[m, "expression_reason"] = "Movement is underpriced but not explosive; finance longer-dated optionality with front decay"
+
+    m = hist_cheap & compressed & (d["iv_hv"] >= 0.85) & (d["iv_hv"] < 1.15)
+    d.loc[m, "best_expression"] = "ATM VEGA CALENDAR"
+    d.loc[m, "expression_reason"] = "Historically cheap IV with subdued acceleration; position for volatility repricing near spot"
+
+    m = expensive & compressed
+    d.loc[m, "best_expression"] = "ATM THETA CALENDAR"
+    d.loc[m, "expression_reason"] = "IV is rich versus realized movement while volatility acceleration is weak"
+
+    # Flag situations where a calendar may be the wrong tool because the move is already accelerating.
+    d["calendar_warning"] = np.where(cheap & strong_accel,
+        "Fast-move risk: compare outright option/backspread before using a calendar", "")
     return d.sort_values("convexity_score",ascending=False)
 
 with st.sidebar:
@@ -116,9 +147,14 @@ m1,m2,m3,m4=st.columns(4)
 m1.metric("Unique symbols",len(master)); m2.metric("IV < HV",int((ranked["iv_hv"]<1).sum()))
 m3.metric("Deep cheap",int(((ranked["iv_hv"]<=.8)&((ranked["iv_rank"]<=25)|(ranked["iv_percentile"]<=25))).sum())); m4.metric("Displayed",len(cand))
 
+st.subheader("Structure mix")
+expr_counts=cand["best_expression"].value_counts().rename_axis("Expression").reset_index(name="Candidates") if len(cand) else pd.DataFrame(columns=["Expression","Candidates"])
+if len(expr_counts):
+    st.dataframe(expr_counts,use_container_width=True,hide_index=True)
+
 t1,t2,t3,t4=st.tabs(["🏆 Ranking","🔎 Inspector","🧭 Regime Map","🧪 Data Audit"])
 with t1:
-    cols=["symbol","convexity_score","regime","iv","hv30","iv_hv","iv_rank","iv_percentile","iv_change","options_volume","underpricing_score","historical_score","acceleration_score","liquidity_score","setup","source"]
+    cols=["symbol","convexity_score","regime","best_expression","iv","hv30","iv_hv","iv_rank","iv_percentile","iv_change","options_volume","underpricing_score","historical_score","acceleration_score","liquidity_score","setup","expression_reason","calendar_warning","source"]
     v=cand[[x for x in cols if x in cand]]
     st.dataframe(v,use_container_width=True,hide_index=True,height=620)
     st.download_button("Download ranked CSV",cand.to_csv(index=False).encode(),"cheap_convexity_ranked.csv","text/csv")
@@ -129,10 +165,16 @@ with t2:
     x1,x2,x3,x4=st.columns(4)
     x1.metric("Convexity Score",f"{r.convexity_score:.1f}"); x2.metric("IV/HV","—" if pd.isna(r.iv_hv) else f"{r.iv_hv:.2f}")
     x3.metric("IV Rank","—" if pd.isna(r.iv_rank) else f"{r.iv_rank:.1f}"); x4.metric("Options Volume","—" if pd.isna(r.options_volume) else f"{r.options_volume:,.0f}")
-    st.write("**Regime:**",r.regime); st.write("**Why flagged:**",r.setup); st.write("**Found in:**",r.source)
+    st.write("**Regime:**",r.regime)
+    st.success(f"Best expression: {r.best_expression}")
+    st.write("**Why flagged:**",r.setup)
+    st.write("**Why this structure:**",r.expression_reason)
+    if r.calendar_warning:
+        st.warning(r.calendar_warning)
+    st.write("**Found in:**",r.source)
     comp=pd.DataFrame({"Score":[r.underpricing_score,r.historical_score,r.acceleration_score,r.liquidity_score]},index=["IV/HV underpricing","Historical cheapness","Acceleration","Liquidity"])
     st.bar_chart(comp)
-    st.info("Next: calendar screener → GEX/DEX destination → chart trigger → ATM vs directional OTM strike.")
+    st.info("Direction is intentionally separate. Next: chart bias + GEX/DEX destination. For LONG OPTION/BACKSPREAD, compare uncapped convexity; for OTM CALENDAR, use the dealer destination as a strike candidate; for ATM calendars, prioritize spot/pin structure.")
 with t3:
     p=ranked.dropna(subset=["iv_hv","iv_rank"])
     if len(p): st.scatter_chart(p,x="iv_hv",y="iv_rank",size="options_volume" if p["options_volume"].notna().any() else None)
