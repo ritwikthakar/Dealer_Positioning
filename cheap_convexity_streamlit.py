@@ -121,6 +121,30 @@ with st.sidebar:
     minvol=st.number_input("Min options volume",0,step=5000,value=10000); mins=st.slider("Min score",0,100,50,5)
     topn=st.slider("Top candidates",5,50,20,5)
     st.markdown("### 🔗 Trading Workflow")
+    st.link_button(
+        "⚡ Cheap Convexity Screener",
+        "YOUR_CHEAP_CONVEXITY_APP_URL",
+        use_container_width=True
+    )
+    
+    st.link_button(
+        "🎯 Dealer Positioning",
+        "https://dealerpositioning-n2m58uzu42afb44usojrwe.streamlit.app/",
+        use_container_width=True
+    )
+    
+    st.link_button(
+        "📊 Dealer / GEX Analysis",
+        "https://dealerpositioning-zenvhgc3fs3dcsd9yunvct.streamlit.app/",
+        use_container_width=True
+    )
+    
+    st.link_button(
+        "🔬 Option Analysis",
+        "https://freedom-fuxffx4ohuuosfojdmffxl.streamlit.app/",
+        use_container_width=True
+    )
+
     
 
 a,b,c=st.columns(3)
@@ -148,31 +172,6 @@ cand=ranked[mask].head(topn)
 m1,m2,m3,m4=st.columns(4)
 m1.metric("Unique symbols",len(master)); m2.metric("IV < HV",int((ranked["iv_hv"]<1).sum()))
 m3.metric("Deep cheap",int(((ranked["iv_hv"]<=.8)&((ranked["iv_rank"]<=25)|(ranked["iv_percentile"]<=25))).sum())); m4.metric("Displayed",len(cand))
-
-st.link_button(
-        "⚡ Cheap Convexity Screener",
-        "YOUR_CHEAP_CONVEXITY_APP_URL",
-        use_container_width=True
-    )
-    
-    st.link_button(
-        "🎯 Dealer Positioning",
-        "https://dealerpositioning-n2m58uzu42afb44usojrwe.streamlit.app/",
-        use_container_width=True
-    )
-    
-    st.link_button(
-        "📊 Dealer / GEX Analysis",
-        "https://dealerpositioning-zenvhgc3fs3dcsd9yunvct.streamlit.app/",
-        use_container_width=True
-    )
-    
-    st.link_button(
-        "🔬 Option Analysis",
-        "https://freedom-fuxffx4ohuuosfojdmffxl.streamlit.app/",
-        use_container_width=True
-    )
-
 
 st.subheader("Structure mix")
 expr_counts=cand["best_expression"].value_counts().rename_axis("Expression").reset_index(name="Candidates") if len(cand) else pd.DataFrame(columns=["Expression","Candidates"])
@@ -210,3 +209,4 @@ with t4:
     st.dataframe(pd.DataFrame(audit,columns=["Screen","Rows","Detected fields"]),use_container_width=True,hide_index=True)
     with st.expander("Merged universe"): st.dataframe(master,use_container_width=True,hide_index=True)
     st.markdown("**Logic:** 40% IV/HV underpricing + 30% historical cheapness + 15% IV acceleration + 15% options liquidity by default. Adjust weights in the sidebar.")
+ 
