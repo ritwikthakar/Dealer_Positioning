@@ -207,23 +207,46 @@ if len(data)<6:
     st.warning(f'Recognized {len(data)}/6 datasets: {", ".join(data.keys()) or "none"}. Upload the remaining files.')
     st.stop()
 
-h,g,x,em,f,u=prep(data); m=regime_metrics(h,g,x,em,f,u); levels=level_table(m,g,x,em,f,u)
+h,g,x,em,f,u=prep(data)
 ticker=str(f['Symbol'].dropna().iloc[0]) if 'Symbol' in f and f['Symbol'].notna().any() else 'Ticker'
-latest_date=h['Date'].max().date() if h['Date'].notna().any() else ''
 
-st.subheader(f'{ticker} • {latest_date}')
+# Analysis-date selector. Historical regime/cards are calculated using only data
+# available on or before the selected date. Dealer/flow files remain the uploaded
+# positioning snapshot because they do not contain historical snapshots.
+valid_dates=sorted(pd.to_datetime(h['Date'].dropna()).dt.date.unique())
+if not valid_dates:
+    st.error('No valid dates were found in the historical option data.')
+    st.stop()
+latest_date=valid_dates[-1]
+header_left,header_right=st.columns([4,1])
+with header_right:
+    selected_date=st.date_input(
+        'Analysis Date', value=latest_date, min_value=valid_dates[0], max_value=latest_date,
+        help='Cards and historical calculations use data on or before this date.'
+    )
+# If a non-trading date is selected, use the latest available observation before it.
+h_view=h[pd.to_datetime(h['Date']).dt.date<=selected_date].copy()
+if h_view.empty:
+    h_view=h.iloc[[0]].copy()
+actual_date=pd.to_datetime(h_view['Date'].max()).date()
+m=regime_metrics(h_view,g,x,em,f,u); levels=level_table(m,g,x,em,f,u)
+
+with header_left:
+    st.subheader(f'{ticker} • {actual_date}')
+if actual_date != selected_date:
+    st.caption(f'Using latest available market observation on {actual_date} for selected date {selected_date}.')
 firstem=em.sort_values('date').iloc[0]
-prev_close=h.iloc[-2]['Close Price'] if len(h)>1 else np.nan
+prev_close=h_view.iloc[-2]['Close Price'] if len(h_view)>1 else np.nan
 close_chg=m['spot']-prev_close if pd.notna(prev_close) else np.nan
 close_pct=(close_chg/prev_close) if pd.notna(prev_close) and prev_close else np.nan
 close_badge=f"Close: {fmt_price(m['spot'])}"
 if pd.notna(close_chg): close_badge += f" &nbsp; {'▲' if close_chg>=0 else '▼'} {close_chg:+.2f} ({close_pct:+.2%})"
 st.markdown(f'<div class="dp-close">{close_badge}</div>',unsafe_allow_html=True)
 
-prev_gex=h.iloc[-2]['GEX Net OI'] if len(h)>1 else np.nan
-prev_dex=h.iloc[-2]['DEX Net OI'] if len(h)>1 else np.nan
-g5=(m['gex']-h.iloc[-6]['GEX Net OI']) if len(h)>=6 else np.nan
-d5=(m['dex']-h.iloc[-6]['DEX Net OI']) if len(h)>=6 else np.nan
+prev_gex=h_view.iloc[-2]['GEX Net OI'] if len(h_view)>1 else np.nan
+prev_dex=h_view.iloc[-2]['DEX Net OI'] if len(h_view)>1 else np.nan
+g5=(m['gex']-h_view.iloc[-6]['GEX Net OI']) if len(h_view)>=6 else np.nan
+d5=(m['dex']-h_view.iloc[-6]['DEX Net OI']) if len(h_view)>=6 else np.nan
 reg_parts=m['regime'].split(' — ',1)
 reg_main=reg_parts[0]; reg_detail=reg_parts[1] if len(reg_parts)>1 else 'Transition'
 em_amt=firstem.get('expected_move_amt',np.nan)
@@ -288,7 +311,7 @@ with T2:
 with T3:
     pos=pd.merge(g,x,on='expiration_dt',how='outer',suffixes=('_gex','_dex')).sort_values('expiration_dt')
     pos['GEX Share']=pos.net_gex.abs()/max(pos.net_gex.abs().sum(),1); pos['DEX Share']=pos.net_dex.abs()/max(pos.net_dex.abs().sum(),1)
-    analysis_date=pd.to_datetime(h['Date'].max()).normalize()
+    analysis_date=pd.Timestamp(actual_date).normalize()
     pos['DTE']=(pd.to_datetime(pos['expiration_dt']).dt.normalize()-analysis_date).dt.days
     em_map=em.copy(); em_map['date']=pd.to_datetime(em_map['date']).dt.normalize()
     em_map['Expected Move']=em_map.apply(lambda r:f"{fmt_price(r['lower_price'])} – {fmt_price(r['upper_price'])} (±{fmt_price(r['expected_move_amt']).replace('$','')}, {r['expected_move_percentage']:.2f}%)",axis=1)
