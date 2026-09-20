@@ -251,9 +251,22 @@ with T1:
     a.metric('Stability Score',f"{m['stability']:.0f}/100",help='Higher = more stabilizing dealer backdrop based on GEX sign/trend and distance from gamma flip.')
     b.metric('Directional Pressure',f"{m['pressure']:.0f}/100",help='Descriptive pressure index. Above 50 = more positive delta/call-side pressure; below 50 = more negative/put-side pressure. Not a trade signal.')
     c.info(f"**Map:** Put wall {fmt_price(m['put_wall'])} • Call wall {fmt_price(m['call_wall'])} • Gamma flip {fmt_price(m['gamma_flip'])} • Max pain {fmt_price(m['maxpain'])}")
+
     st.markdown('#### Areas of Interest')
-    show=levels.head(15).copy(); show['Confluence']=show['Confluence'].round(0).astype(int); show['Distance']=show['Distance'].map(lambda z:f'{z:+.1%}'); show['Weighted Flow Premium']=show['Weighted Flow Premium'].map(fmt_money); show['Max Vol/OI']=show['Max Vol/OI'].map(lambda z:f'{z:.1f}x' if z else '—')
-    st.dataframe(show,use_container_width=True,hide_index=True,column_config={'Confluence':st.column_config.ProgressColumn('Confluence',min_value=0,max_value=100)})
+    ao=levels.copy()
+    ao['Zone']=np.where(ao['Level'] < m['spot']-0.01,'Support',np.where(ao['Level'] > m['spot']+0.01,'Resistance','Pivot'))
+    ao['Abs Distance']=ao['Distance'].abs()
+    f1,f2,f3,f4=st.columns(4)
+    zone_sel=f1.multiselect('Zone',['Support','Resistance','Pivot'],default=['Support','Resistance','Pivot'],key='aoi_zone')
+    min_conf=f2.slider('Min Confluence',0,100,0,5,key='aoi_conf')
+    max_dist=f3.slider('Max distance from spot',1,100,25,1,format='%d%%',key='aoi_dist')/100
+    min_flow=f4.number_input('Min weighted flow premium',min_value=0.0,value=0.0,step=100000.0,key='aoi_flow')
+    ao=ao[ao['Zone'].isin(zone_sel)&(ao['Confluence']>=min_conf)&(ao['Abs Distance']<=max_dist)&(ao['Weighted Flow Premium']>=min_flow)]
+    show=ao.head(30).drop(columns=['Abs Distance']).copy()
+    show['Confluence']=show['Confluence'].round(0).astype(int); show['Distance']=show['Distance'].map(lambda z:f'{z:+.1%}'); show['Weighted Flow Premium']=show['Weighted Flow Premium'].map(fmt_money); show['Max Vol/OI']=show['Max Vol/OI'].map(lambda z:f'{z:.1f}x' if z else '—')
+    st.dataframe(show,use_container_width=True,hide_index=True,column_config={'Confluence':st.column_config.ProgressColumn('Confluence',min_value=0,max_value=100),'Zone':st.column_config.TextColumn('Zone',help='Below spot = Support; above spot = Resistance; at spot = Pivot.')})
+    st.caption('Zone is relative to current spot: levels below spot are potential support; levels above spot are potential resistance. Price/TA confirmation is still required.')
+
     fig=go.Figure(); ee=em.sort_values('date').head(20)
     fig.add_trace(go.Scatter(x=ee.date,y=ee.upper_price,name='EM Upper',mode='lines'))
     fig.add_trace(go.Scatter(x=ee.date,y=ee.lower_price,name='EM Lower',mode='lines',fill='tonexty'))
@@ -275,12 +288,26 @@ with T2:
 with T3:
     pos=pd.merge(g,x,on='expiration_dt',how='outer',suffixes=('_gex','_dex')).sort_values('expiration_dt')
     pos['GEX Share']=pos.net_gex.abs()/max(pos.net_gex.abs().sum(),1); pos['DEX Share']=pos.net_dex.abs()/max(pos.net_dex.abs().sum(),1)
-    disp=pos[['expiration_dt','net_gex','net_dex','call_gex','put_gex','call_dex','put_dex','call_wall_gex','put_wall_gex','gamma_flip','GEX Share','DEX Share']].copy()
-    disp.columns=['Expiration','Net GEX','Net DEX','Call GEX','Put GEX','Call DEX','Put DEX','Call Wall','Put Wall','Gamma Flip','GEX Share','DEX Share']
+    analysis_date=pd.to_datetime(h['Date'].max()).normalize()
+    pos['DTE']=(pd.to_datetime(pos['expiration_dt']).dt.normalize()-analysis_date).dt.days
+    em_map=em.copy(); em_map['date']=pd.to_datetime(em_map['date']).dt.normalize()
+    em_map['Expected Move']=em_map.apply(lambda r:f"{fmt_price(r['lower_price'])} – {fmt_price(r['upper_price'])} (±{fmt_price(r['expected_move_amt']).replace('$','')}, {r['expected_move_percentage']:.2f}%)",axis=1)
+    pos=pos.merge(em_map[['date','Expected Move']],left_on=pd.to_datetime(pos['expiration_dt']).dt.normalize(),right_on='date',how='left').drop(columns=['date'])
+
+    st.markdown('#### Dealer Positioning by Expiration')
+    q1,q2,q3,q4=st.columns(4)
+    max_dte=int(max(pos['DTE'].max(),1)); min_dte=q1.number_input('Min DTE',0,max_dte,0,key='pos_mindte'); max_dte_sel=q2.number_input('Max DTE',0,max_dte,max_dte,key='pos_maxdte')
+    gsign=q3.multiselect('GEX sign',['Positive','Negative'],default=['Positive','Negative'],key='pos_gsign'); dsign=q4.multiselect('DEX sign',['Positive','Negative'],default=['Positive','Negative'],key='pos_dsign')
+    filt=pos[(pos.DTE>=min_dte)&(pos.DTE<=max_dte_sel)].copy()
+    filt=filt[((filt.net_gex>=0)&('Positive' in gsign))|((filt.net_gex<0)&('Negative' in gsign))]
+    filt=filt[((filt.net_dex>=0)&('Positive' in dsign))|((filt.net_dex<0)&('Negative' in dsign))]
+    disp=filt[['expiration_dt','DTE','net_gex','net_dex','call_gex','put_gex','call_dex','put_dex','call_wall_gex','put_wall_gex','gamma_flip','Expected Move','GEX Share','DEX Share']].copy()
+    disp.columns=['Expiration','DTE','Net GEX','Net DEX','Call GEX','Put GEX','Call DEX','Put DEX','Call Wall','Put Wall','Gamma Flip','Expected Move','GEX Share','DEX Share']
     st.dataframe(disp,use_container_width=True,hide_index=True,column_config={'GEX Share':st.column_config.ProgressColumn(format='%.1%%',min_value=0,max_value=1),'DEX Share':st.column_config.ProgressColumn(format='%.1%%',min_value=0,max_value=1)})
+    st.caption('Expected Move is matched to the expiration date when that date exists in the uploaded expected-move file; otherwise it is left blank.')
     col1,col2=st.columns(2)
-    fig=go.Figure(go.Bar(x=pos.expiration_dt,y=pos.net_gex)); fig.add_hline(y=0); fig.update_layout(height=350,title='Net GEX by Expiration'); col1.plotly_chart(fig,use_container_width=True)
-    fig=go.Figure(go.Bar(x=pos.expiration_dt,y=pos.net_dex)); fig.add_hline(y=0); fig.update_layout(height=350,title='Net DEX by Expiration'); col2.plotly_chart(fig,use_container_width=True)
+    fig=go.Figure(go.Bar(x=filt.expiration_dt,y=filt.net_gex)); fig.add_hline(y=0); fig.update_layout(height=350,title='Net GEX by Expiration'); col1.plotly_chart(fig,use_container_width=True)
+    fig=go.Figure(go.Bar(x=filt.expiration_dt,y=filt.net_dex)); fig.add_hline(y=0); fig.update_layout(height=350,title='Net DEX by Expiration'); col2.plotly_chart(fig,use_container_width=True)
 
 with T4:
     c1,c2,c3,c4=st.columns(4)
