@@ -1,472 +1,269 @@
-
 from __future__ import annotations
 
-import io
-import math
-import re
-from datetime import date, datetime, timedelta
-
+import io, re
+from collections import defaultdict
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-try:
-    import yfinance as yf
-except Exception:
-    yf = None
+st.set_page_config(page_title='Dealer Positioning Command Center', page_icon='🎯', layout='wide')
 
+# ---------- Styling ----------
+st.markdown('''
+<style>
+.block-container{padding-top:1.1rem;padding-bottom:2rem;max-width:1500px}
+[data-testid="stMetric"]{background:rgba(127,127,127,.07);border:1px solid rgba(127,127,127,.18);padding:12px 14px;border-radius:12px}
+.small-note{opacity:.72;font-size:.86rem}.pill{display:inline-block;padding:3px 9px;border-radius:999px;border:1px solid rgba(127,127,127,.3);margin-right:5px;font-size:.8rem}
+</style>''', unsafe_allow_html=True)
 
-st.set_page_config(page_title="Dealer Positioning Map", layout="wide")
+# ---------- Helpers ----------
+def num(x):
+    if pd.isna(x): return np.nan
+    if isinstance(x,(int,float,np.number)): return float(x)
+    s=str(x).strip().replace(',','').replace('$','').replace('%','')
+    mult=1
+    if s.endswith(('K','k')): mult=1e3; s=s[:-1]
+    elif s.endswith(('M','m')): mult=1e6; s=s[:-1]
+    elif s.endswith(('B','b')): mult=1e9; s=s[:-1]
+    try:return float(s)*mult
+    except:return np.nan
 
-st.title("Dealer Positioning + Expected Move Map")
-st.caption(
-    "Upload the six OptionsCharts-style CSVs. The app maps expected move, "
-    "gamma flip, call/put walls and recurring high-importance gamma levels, "
-    "then flags potential buy/sell areas of interest."
-)
+def pct(x):
+    v=num(x); return v/100 if pd.notna(v) else np.nan
 
+def fmt_money(x):
+    if pd.isna(x): return '—'
+    a=abs(x)
+    if a>=1e9:return f'${x/1e9:,.2f}B'
+    if a>=1e6:return f'${x/1e6:,.2f}M'
+    if a>=1e3:return f'${x/1e3:,.1f}K'
+    return f'${x:,.0f}'
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def read_csv(uploaded_file):
-    if uploaded_file is None:
-        return None
-    return pd.read_csv(uploaded_file)
+def fmt_price(x): return '—' if pd.isna(x) else f'${x:,.2f}'
 
+def zclip(v, lo=0, hi=100): return float(np.clip(v,lo,hi))
 
-def infer_ticker(name: str, fallback="SPY") -> str:
-    if not name:
-        return fallback
-    m = re.search(r"([A-Z]{1,6})(?:_|-)", name.upper())
-    return m.group(1) if m else fallback
+def first_valid(*xs):
+    for x in xs:
+        if pd.notna(x): return x
+    return np.nan
 
+def classify(df):
+    c=set(df.columns)
+    if {'Date','Close Price','GEX Net OI','DEX Net OI'}.issubset(c): return 'history'
+    if {'expiration','net_gex','call_gex','put_gex','gamma_flip'}.issubset(c): return 'gex'
+    if {'expiration','net_dex','call_dex','put_dex'}.issubset(c): return 'dex'
+    if {'date','expected_move_amt','upper_price','lower_price'}.issubset(c): return 'em'
+    if {'Symbol','Premium','Side','Code','Trade','Size'}.issubset(c): return 'flow'
+    if {'Symbol','Vol/OI','Moneyness','Imp Vol','Open Int'}.issubset(c): return 'unusual'
+    return None
 
-def parse_expiration(s):
-    return pd.to_datetime(s, errors="coerce")
-
-
-def nearest_increment(x: float, inc: float = 5.0) -> float:
-    if pd.isna(x):
-        return np.nan
-    return round(float(x) / inc) * inc
-
-
-def weighted_median(values, weights):
-    values = np.asarray(values, dtype=float)
-    weights = np.asarray(weights, dtype=float)
-    mask = np.isfinite(values) & np.isfinite(weights) & (weights > 0)
-    if not mask.any():
-        return np.nan
-    values, weights = values[mask], weights[mask]
-    order = np.argsort(values)
-    values, weights = values[order], weights[order]
-    cutoff = weights.sum() / 2.0
-    return float(values[np.searchsorted(np.cumsum(weights), cutoff)])
-
-
-def weighted_mode_level(values, weights, increment=5.0):
-    rows = []
-    for v, w in zip(values, weights):
-        if pd.isna(v) or pd.isna(w):
-            continue
-        lvl = nearest_increment(float(v), increment)
-        rows.append((lvl, float(w)))
-    if not rows:
-        return np.nan
-    d = pd.DataFrame(rows, columns=["level", "weight"])
-    g = d.groupby("level", as_index=False)["weight"].sum().sort_values("weight", ascending=False)
-    return float(g.iloc[0]["level"])
-
-
-def build_level_scores(gex_exp: pd.DataFrame, spot: float, n_expiries=5, half_life_days=10, increment=5.0):
-    d = gex_exp.copy()
-    d["expiration"] = pd.to_datetime(d["expiration"], errors="coerce")
-    d = d.dropna(subset=["expiration"]).sort_values("expiration")
-
-    today = pd.Timestamp.today().normalize()
-    d = d[d["expiration"] >= today].head(n_expiries)
-    if d.empty:
-        d = gex_exp.copy()
-        d["expiration"] = pd.to_datetime(d["expiration"], errors="coerce")
-        d = d.dropna(subset=["expiration"]).sort_values("expiration").head(n_expiries)
-
-    d["days"] = (d["expiration"] - today).dt.days.clip(lower=0)
-    d["time_weight"] = np.exp(-np.log(2) * d["days"] / max(half_life_days, 1))
-    d["gex_weight"] = d["net_gex"].abs().fillna(0)
-    scale = d["gex_weight"].max()
-    if not np.isfinite(scale) or scale == 0:
-        d["mag_weight"] = 1.0
-    else:
-        d["mag_weight"] = 0.25 + 0.75 * (d["gex_weight"] / scale)
-    d["weight"] = d["time_weight"] * d["mag_weight"]
-
-    # Composite structural levels:
-    call_wall = weighted_mode_level(d["call_wall"], d["weight"], increment)
-    put_wall = weighted_mode_level(d["put_wall"], d["weight"], increment)
-    gamma_flip = weighted_median(d["gamma_flip"], d["weight"])
-
-    # "Important gamma levels" from recurring wall/flip concentrations.
-    rows = []
-    for _, r in d.iterrows():
-        for kind, factor in [("Call Wall", 1.0), ("Put Wall", 1.0), ("Gamma Flip", 0.65)]:
-            col = {"Call Wall": "call_wall", "Put Wall": "put_wall", "Gamma Flip": "gamma_flip"}[kind]
-            v = r.get(col)
-            if pd.isna(v):
-                continue
-            lvl = nearest_increment(float(v), increment)
-            rows.append({
-                "Level": lvl,
-                "Type": kind,
-                "Score": float(r["weight"]) * factor,
-                "Expiration": r["expiration"].date(),
-            })
-
-    detail = pd.DataFrame(rows)
-    if detail.empty:
-        imp = pd.DataFrame(columns=["Level", "Importance", "Occurrences", "Types"])
-    else:
-        imp = (
-            detail.groupby("Level")
-            .agg(
-                Importance=("Score", "sum"),
-                Occurrences=("Level", "size"),
-                Types=("Type", lambda x: ", ".join(sorted(set(x)))),
-            )
-            .reset_index()
-        )
-        if imp["Importance"].max() > 0:
-            imp["Importance"] = 100 * imp["Importance"] / imp["Importance"].max()
-        imp = imp.sort_values(["Importance", "Occurrences"], ascending=False)
-
-    return d, call_wall, put_wall, gamma_flip, imp
-
-
-def select_expected_move(em: pd.DataFrame, expiry_date):
-    d = em.copy()
-    d["date"] = pd.to_datetime(d["date"], errors="coerce")
-    d = d.dropna(subset=["date"]).sort_values("date")
-    if d.empty:
-        return None
-    target = pd.Timestamp(expiry_date)
-    idx = (d["date"] - target).abs().idxmin()
-    return d.loc[idx]
-
-
-def get_price_data(ticker, history_df, period="6mo"):
-    # Prefer OHLC from Yahoo for candles.
-    if yf is not None:
+def load_uploaded(files):
+    out={}; errors=[]
+    for f in files:
         try:
-            px = yf.download(ticker, period=period, interval="1d", auto_adjust=False, progress=False)
-            if not px.empty:
-                if isinstance(px.columns, pd.MultiIndex):
-                    px.columns = [c[0] for c in px.columns]
-                px = px.reset_index()
-                px = px.rename(columns={"Date": "date"})
-                needed = {"Open", "High", "Low", "Close"}
-                if needed.issubset(px.columns):
-                    return px[["date", "Open", "High", "Low", "Close"]].dropna()
-        except Exception:
-            pass
+            d=pd.read_csv(f); k=classify(d)
+            if k and k not in out: out[k]=d
+            elif not k: errors.append(f'{f.name}: unrecognized columns')
+            else: errors.append(f'{f.name}: duplicate {k} file ignored')
+        except Exception as e: errors.append(f'{f.name}: {e}')
+    return out, errors
 
-    # Fallback: close-only synthetic OHLC so the app still renders.
-    d = history_df.copy()
-    d["date"] = pd.to_datetime(d["timestamp"], errors="coerce")
-    d = d.dropna(subset=["date", "close_price"]).sort_values("date")
-    d["Open"] = d["close_price"].shift(1).fillna(d["close_price"])
-    d["Close"] = d["close_price"]
-    d["High"] = d[["Open", "Close"]].max(axis=1)
-    d["Low"] = d[["Open", "Close"]].min(axis=1)
-    return d[["date", "Open", "High", "Low", "Close"]]
+def demo_data():
+    paths={
+      'history':'/mnt/data/option_history_coin(2).csv','gex':'/mnt/data/net_gex_exposure_by_expiration_COIN(4).csv',
+      'dex':'/mnt/data/net_dex_exposure_by_expiration_COIN(1).csv','em':'/mnt/data/COIN_expected_move_2026-09-25_w(1).csv',
+      'flow':'/mnt/data/coin-options-flow-09-20-2026(1).csv','unusual':'/mnt/data/unusual-options-activity-09-20-2026(1).csv'}
+    try:return {k:pd.read_csv(v) for k,v in paths.items()}
+    except:return {}
 
+def prep(d):
+    h=d['history'].copy(); h['Date']=pd.to_datetime(h['Date'],errors='coerce')
+    for c in ['Close Price','Option Volume Total','Option Volume Put-Call Ratio','OI Total','OI Put-Call Ratio','IV 30d','IV Rank','Max Pain 1d','GEX Net OI','DEX Net OI']:
+        if c in h: h[c]=h[c].map(num)
+    h=h.sort_values('Date')
+    g=d['gex'].copy(); x=d['dex'].copy()
+    g['expiration_dt']=pd.to_datetime(g['expiration'],errors='coerce'); x['expiration_dt']=pd.to_datetime(x['expiration'],errors='coerce')
+    for c in ['net_gex','call_gex','put_gex','call_wall','put_wall','gamma_flip']: g[c]=g[c].map(num)
+    for c in ['net_dex','call_dex','put_dex','call_wall','put_wall']: x[c]=x[c].map(num)
+    em=d['em'].copy(); em['date']=pd.to_datetime(em['date'],errors='coerce')
+    for c in ['expected_move_amt','expected_move_percentage','upper_price','lower_price','implied_volatility']: em[c]=em[c].map(num)
+    f=d['flow'].copy(); u=d['unusual'].copy()
+    for c in ['Price~','Strike','DTE','Trade','Size','Premium','Volume','Open Int','Delta']:
+        if c in f:f[c]=f[c].map(num)
+    for c in ['Price~','Strike','DTE','Bid','Latest','Ask','Volume','Open Int','Vol/OI','Delta']:
+        if c in u:u[c]=u[c].map(num)
+    f['Exp Date']=pd.to_datetime(f['Exp Date'],errors='coerce'); u['Exp Date']=pd.to_datetime(u['Exp Date'],errors='coerce')
+    return h,g,x,em,f,u
 
-def add_hline(fig, y, text, dash="dash", width=1.5):
-    if y is None or pd.isna(y):
-        return
-    fig.add_hline(
-        y=float(y),
-        line_dash=dash,
-        line_width=width,
-        annotation_text=text,
-        annotation_position="right",
-    )
+def regime_metrics(h,g,x,em,f,u):
+    last=h.iloc[-1]; prev=h.iloc[-2] if len(h)>1 else last
+    spot=first_valid(last.get('Close Price'), f['Price~'].dropna().iloc[-1] if f['Price~'].notna().any() else np.nan)
+    gex=last.get('GEX Net OI',np.nan); dex=last.get('DEX Net OI',np.nan)
+    dg=gex-prev.get('GEX Net OI',gex); dd=dex-prev.get('DEX Net OI',dex)
+    iv=last.get('IV 30d',np.nan); ivr=last.get('IV Rank',np.nan)
+    # Regime label: sign + recent change
+    if gex>=0:
+        reg='Positive Gamma — Strengthening' if dg>0 else 'Positive Gamma — Weakening'
+    else:
+        reg='Negative Gamma — Deepening' if dg<0 else 'Negative Gamma — Recovering'
+    if np.sign(gex)!=np.sign(prev.get('GEX Net OI',gex)): reg='Gamma Regime Transition'
+    # weighted nearest expiration levels
+    gg=g[g['expiration_dt']>=h['Date'].max()].sort_values('expiration_dt')
+    if gg.empty: gg=g.sort_values('expiration_dt')
+    gr=gg.iloc[0]
+    # Scores are descriptive, not directional recommendations
+    g_scale=max(h['GEX Net OI'].abs().quantile(.75),1)
+    d_scale=max(h['DEX Net OI'].abs().quantile(.75),1)
+    stability=50 + 25*np.tanh(gex/g_scale) + 10*np.tanh(dg/g_scale)
+    if pd.notna(gr.gamma_flip) and pd.notna(spot): stability += 10*np.tanh((spot-gr.gamma_flip)/(spot*.08))
+    stability=zclip(stability)
+    # directional pressure: positive means call/delta pressure; negative put pressure
+    ask=f[f['Side'].astype(str).str.lower().eq('ask')]['Premium'].sum()
+    bid=f[f['Side'].astype(str).str.lower().eq('bid')]['Premium'].sum()
+    flow_bias=(ask-bid)/max(ask+bid,1)
+    pressure=50 + 22*np.tanh(dex/d_scale) + 13*flow_bias
+    pressure=zclip(pressure)
+    return dict(spot=spot,gex=gex,dex=dex,dg=dg,dd=dd,iv=iv,ivr=ivr,regime=reg,stability=stability,pressure=pressure,
+                gamma_flip=gr.get('gamma_flip',np.nan),call_wall=gr.get('call_wall',np.nan),put_wall=gr.get('put_wall',np.nan),maxpain=last.get('Max Pain 1d',np.nan))
 
+def level_table(m,g,x,em,f,u):
+    spot=m['spot']; rows=defaultdict(lambda:{'score':0,'evidence':[],'flow_premium':0,'unusual':0})
+    def add(level, pts, label):
+        if pd.isna(level): return
+        k=round(float(level)*2)/2
+        rows[k]['score']+=pts; rows[k]['evidence'].append(label)
+    # nearest 4 expirations, diminishing weights
+    gs=g.sort_values('expiration_dt').head(4)
+    for i,r in gs.iterrows():
+        w=18 if len(rows)==0 else 12
+        add(r.call_wall,14,'GEX Call Wall'); add(r.put_wall,14,'GEX Put Wall'); add(r.gamma_flip,18,'Gamma Flip')
+    for _,r in x.sort_values('expiration_dt').head(4).iterrows():
+        add(r.call_wall,10,'DEX Call Wall'); add(r.put_wall,10,'DEX Put Wall')
+    add(m['maxpain'],10,'Max Pain')
+    # expected move: first 5 future dates, boundary points
+    for _,r in em.sort_values('date').head(5).iterrows(): add(r.upper_price,12,'EM Upper'); add(r.lower_price,12,'EM Lower')
+    # flow by strike, downweight mid and complex prints
+    ff=f.copy(); ff['weight']=np.where(ff['Side'].astype(str).str.lower().eq('ask'),1.0,np.where(ff['Side'].astype(str).str.lower().eq('bid'),1.0,.35))
+    ff['weight']*=np.where(ff['Code'].astype(str).str.upper().str.startswith('ML'),.45,1.0)
+    agg=ff.groupby('Strike').apply(lambda z: pd.Series({'prem':(z.Premium.fillna(0)*z.weight).sum(),'vol':z.Volume.sum()}),include_groups=False).reset_index()
+    if len(agg):
+        p95=max(agg.prem.quantile(.95),1)
+        for _,r in agg.iterrows():
+            pts=min(22,22*np.log1p(r.prem)/np.log1p(p95)) if r.prem>0 else 0
+            add(r.Strike,pts,'Flow'); k=round(float(r.Strike)*2)/2; rows[k]['flow_premium']+=r.prem
+    uu=u.copy(); uu['voi']=uu['Vol/OI'].fillna(0).clip(lower=0)
+    ua=uu.groupby('Strike').agg(max_voi=('voi','max'),contracts=('Volume','sum')).reset_index()
+    if len(ua):
+        for _,r in ua.iterrows():
+            pts=min(20,5*np.log1p(r.max_voi)); add(r.Strike,pts,'Unusual'); rows[round(float(r.Strike)*2)/2]['unusual']=r.max_voi
+    out=[]
+    for lvl,v in rows.items():
+        dist=(lvl-spot)/spot if spot else np.nan
+        prox=max(0,8*(1-abs(dist)/.08)) if pd.notna(dist) else 0
+        score=min(100,v['score']+prox)
+        ev=list(dict.fromkeys(v['evidence']))
+        if 'Gamma Flip' in ev: cls='Regime boundary'
+        elif 'EM Upper' in ev: cls='Upper reaction / extension'
+        elif 'EM Lower' in ev: cls='Lower reaction / extension'
+        elif any('Wall' in e for e in ev) and lvl>spot: cls='Upper reaction / pivot'
+        elif any('Wall' in e for e in ev) and lvl<spot: cls='Lower reaction / pivot'
+        else: cls='Flow / positioning pivot'
+        out.append([lvl,score,dist,v['flow_premium'],v['unusual'],', '.join(ev),cls])
+    return pd.DataFrame(out,columns=['Level','Confluence','Distance','Weighted Flow Premium','Max Vol/OI','Evidence','Classification']).sort_values('Confluence',ascending=False)
 
-# -----------------------------
-# Uploads
-# -----------------------------
+# ---------- Sidebar / load ----------
+st.title('🎯 Dealer Positioning Command Center')
+st.caption('Regime → Positioning → Flow → Levels → Setup  •  Six-file dealer/flow model')
 with st.sidebar:
-    st.header("Upload files")
-    dex_hist_f = st.file_uploader("DEX history", type="csv")
-    gex_hist_f = st.file_uploader("GEX history", type="csv")
-    iv_hist_f = st.file_uploader("IV history", type="csv")
-    em_f = st.file_uploader("Expected move", type="csv")
-    dex_exp_f = st.file_uploader("DEX by expiration", type="csv")
-    gex_exp_f = st.file_uploader("GEX by expiration", type="csv")
-    st.markdown("### 🔗 Trading Workflow")
+    st.header('Data')
+    uploads=st.file_uploader('Drop all 6 CSV files',type='csv',accept_multiple_files=True,help='Files are identified automatically from their columns.')
+    use_demo=st.toggle('Use bundled COIN files',value=not bool(uploads))
+    st.divider(); st.caption('Required: historical option data, GEX by expiration, DEX by expiration, expected move, options flow, unusual activity.')
 
-    st.link_button(
-        "⚡ Convexity Screener",
-        "YOUR_CHEAP_CONVEXITY_APP_URL",
-        use_container_width=True
-    )
-    
-    st.link_button(
-        "🎯 Dealer Positioning",
-        "https://dealerpositioning-n2m58uzu42afb44usojrwe.streamlit.app/",
-        use_container_width=True
-    )
-    
-    st.link_button(
-        "📊 Option Contract Analysis",
-        "https://dealerpositioning-zenvhgc3fs3dcsd9yunvct.streamlit.app/",
-        use_container_width=True
-    )
-    
-    st.link_button(
-        "🔬 Calender Spread Regime Screening",
-        "https://freedom-fuxffx4ohuuosfojdmffxl.streamlit.app/",
-        use_container_width=True
-    )
-
-    st.divider()
-    ticker_input = st.text_input("Ticker override", value="")
-    n_exp = st.slider("Near expiries to combine", 1, 10, 5)
-    half_life = st.slider("Expiry weight half-life (days)", 3, 30, 10)
-    strike_inc = st.selectbox("Gamma-level grouping increment", [1.0, 2.5, 5.0, 10.0], index=2)
-    chart_period = st.selectbox("Chart history", ["3mo", "6mo", "1y"], index=1)
-    aoi_pct = st.slider("AOI tolerance (% of spot)", 0.10, 2.00, 0.50, 0.05)
-    max_imp_levels = st.slider("Important gamma levels on chart", 2, 10, 5)
-
-
-files = [dex_hist_f, gex_hist_f, iv_hist_f, em_f, dex_exp_f, gex_exp_f]
-if not all(files):
-    st.info("Upload all six CSVs to build the dealer-positioning map.")
+data=demo_data() if use_demo else load_uploaded(uploads)[0]
+if len(data)<6:
+    st.warning(f'Recognized {len(data)}/6 datasets: {", ".join(data.keys()) or "none"}. Upload the remaining files.')
     st.stop()
 
-dex_hist = read_csv(dex_hist_f)
-gex_hist = read_csv(gex_hist_f)
-iv_hist = read_csv(iv_hist_f)
-em = read_csv(em_f)
-dex_exp = read_csv(dex_exp_f)
-gex_exp = read_csv(gex_exp_f)
+h,g,x,em,f,u=prep(data); m=regime_metrics(h,g,x,em,f,u); levels=level_table(m,g,x,em,f,u)
+ticker=str(f['Symbol'].dropna().iloc[0]) if 'Symbol' in f and f['Symbol'].notna().any() else 'Ticker'
+latest_date=h['Date'].max().date() if h['Date'].notna().any() else ''
 
-ticker = ticker_input.strip().upper() or infer_ticker(gex_hist_f.name, "SPY")
+st.subheader(f'{ticker} • {latest_date}')
+c=st.columns(6)
+c[0].metric('Dealer Regime',m['regime'])
+c[1].metric('Net GEX',fmt_money(m['gex']),fmt_money(m['dg'])+' 1D')
+c[2].metric('Net DEX',fmt_money(m['dex']),fmt_money(m['dd'])+' 1D')
+c[3].metric('IV30 / IV Rank',f"{m['iv']:.1f}% / {m['ivr']:.1f}%")
+c[4].metric('Gamma Flip',fmt_price(m['gamma_flip']),f"Spot {fmt_price(m['spot'])}")
+firstem=em.sort_values('date').iloc[0]
+c[5].metric('Next Expected Move',f"{fmt_price(firstem.lower_price)} – {fmt_price(firstem.upper_price)}",str(firstem.date.date()))
 
-# Basic validation
-required_gex = {"expiration", "net_gex", "call_gex", "put_gex", "call_wall", "put_wall", "gamma_flip"}
-required_em = {"date", "expected_move_amt", "upper_price", "lower_price", "implied_volatility"}
-required_hist = {"timestamp", "close_price"}
+T1,T2,T3,T4,T5=st.tabs(['🎯 Command Center','📈 Historical Regime','🧲 Dealer Positioning','🌊 Flow Intelligence','🔬 Strike Explorer'])
 
-missing = []
-if not required_gex.issubset(gex_exp.columns):
-    missing.append(f"GEX by expiration missing: {sorted(required_gex - set(gex_exp.columns))}")
-if not required_em.issubset(em.columns):
-    missing.append(f"Expected move missing: {sorted(required_em - set(em.columns))}")
-if not required_hist.issubset(gex_hist.columns):
-    missing.append(f"GEX history missing: {sorted(required_hist - set(gex_hist.columns))}")
+with T1:
+    a,b,c=st.columns([1,1,2])
+    a.metric('Stability Score',f"{m['stability']:.0f}/100",help='Higher = more stabilizing dealer backdrop based on GEX sign/trend and distance from gamma flip.')
+    b.metric('Directional Pressure',f"{m['pressure']:.0f}/100",help='Descriptive pressure index. Above 50 = more positive delta/call-side pressure; below 50 = more negative/put-side pressure. Not a trade signal.')
+    c.info(f"**Map:** Put wall {fmt_price(m['put_wall'])} • Call wall {fmt_price(m['call_wall'])} • Gamma flip {fmt_price(m['gamma_flip'])} • Max pain {fmt_price(m['maxpain'])}")
+    st.markdown('#### Areas of Interest')
+    show=levels.head(15).copy(); show['Confluence']=show['Confluence'].round(0).astype(int); show['Distance']=show['Distance'].map(lambda z:f'{z:+.1%}'); show['Weighted Flow Premium']=show['Weighted Flow Premium'].map(fmt_money); show['Max Vol/OI']=show['Max Vol/OI'].map(lambda z:f'{z:.1f}x' if z else '—')
+    st.dataframe(show,use_container_width=True,hide_index=True,column_config={'Confluence':st.column_config.ProgressColumn('Confluence',min_value=0,max_value=100)})
+    fig=go.Figure(); ee=em.sort_values('date').head(20)
+    fig.add_trace(go.Scatter(x=ee.date,y=ee.upper_price,name='EM Upper',mode='lines'))
+    fig.add_trace(go.Scatter(x=ee.date,y=ee.lower_price,name='EM Lower',mode='lines',fill='tonexty'))
+    fig.add_hline(y=m['spot'],annotation_text=f'Spot {m["spot"]:.2f}')
+    for y,name in [(m['gamma_flip'],'Gamma Flip'),(m['call_wall'],'Call Wall'),(m['put_wall'],'Put Wall')]:
+        if pd.notna(y): fig.add_hline(y=y,line_dash='dot',annotation_text=name)
+    fig.update_layout(height=420,title='Expected Move Envelope + Dealer Levels',xaxis_title='',yaxis_title='Price',legend_orientation='h')
+    st.plotly_chart(fig,use_container_width=True)
 
-if missing:
-    st.error("\n".join(missing))
-    st.stop()
+with T2:
+    days=st.segmented_control('Window',['20D','60D','All'],default='60D')
+    hh=h.tail(20 if days=='20D' else 60 if days=='60D' else len(h))
+    fig=go.Figure(); fig.add_trace(go.Scatter(x=hh.Date,y=hh['Close Price'],name='Close')); fig.add_trace(go.Scatter(x=hh.Date,y=hh['Max Pain 1d'],name='Max Pain',line=dict(dash='dot'))); fig.update_layout(height=350,title='Price vs Max Pain'); st.plotly_chart(fig,use_container_width=True)
+    col1,col2=st.columns(2)
+    for col,y,title in [(col1,'GEX Net OI','Net GEX History'),(col2,'DEX Net OI','Net DEX History')]:
+        fig=go.Figure(go.Bar(x=hh.Date,y=hh[y],name=y)); fig.add_hline(y=0); fig.update_layout(height=330,title=title); col.plotly_chart(fig,use_container_width=True)
+    fig=go.Figure(); fig.add_trace(go.Scatter(x=hh.Date,y=hh['IV 30d'],name='IV30')); fig.add_trace(go.Scatter(x=hh.Date,y=hh['IV Rank'],name='IV Rank')); fig.update_layout(height=330,title='Volatility Regime'); st.plotly_chart(fig,use_container_width=True)
 
-# Spot from latest close in GEX history
-gex_hist["timestamp"] = pd.to_datetime(gex_hist["timestamp"], errors="coerce")
-latest_hist = gex_hist.dropna(subset=["timestamp", "close_price"]).sort_values("timestamp")
-spot = float(latest_hist.iloc[-1]["close_price"])
-spot_date = latest_hist.iloc[-1]["timestamp"].date()
+with T3:
+    pos=pd.merge(g,x,on='expiration_dt',how='outer',suffixes=('_gex','_dex')).sort_values('expiration_dt')
+    pos['GEX Share']=pos.net_gex.abs()/max(pos.net_gex.abs().sum(),1); pos['DEX Share']=pos.net_dex.abs()/max(pos.net_dex.abs().sum(),1)
+    disp=pos[['expiration_dt','net_gex','net_dex','call_gex','put_gex','call_dex','put_dex','call_wall_gex','put_wall_gex','gamma_flip','GEX Share','DEX Share']].copy()
+    disp.columns=['Expiration','Net GEX','Net DEX','Call GEX','Put GEX','Call DEX','Put DEX','Call Wall','Put Wall','Gamma Flip','GEX Share','DEX Share']
+    st.dataframe(disp,use_container_width=True,hide_index=True,column_config={'GEX Share':st.column_config.ProgressColumn(format='%.1%%',min_value=0,max_value=1),'DEX Share':st.column_config.ProgressColumn(format='%.1%%',min_value=0,max_value=1)})
+    col1,col2=st.columns(2)
+    fig=go.Figure(go.Bar(x=pos.expiration_dt,y=pos.net_gex)); fig.add_hline(y=0); fig.update_layout(height=350,title='Net GEX by Expiration'); col1.plotly_chart(fig,use_container_width=True)
+    fig=go.Figure(go.Bar(x=pos.expiration_dt,y=pos.net_dex)); fig.add_hline(y=0); fig.update_layout(height=350,title='Net DEX by Expiration'); col2.plotly_chart(fig,use_container_width=True)
 
-# Expiry selector based on expected move file
-em_dates = pd.to_datetime(em["date"], errors="coerce").dropna().sort_values().unique()
-default_idx = min(len(em_dates) - 1, 4) if len(em_dates) else 0
-chosen_expiry = st.selectbox(
-    "Expected-move horizon",
-    options=[pd.Timestamp(x).date() for x in em_dates],
-    index=default_idx,
-)
+with T4:
+    c1,c2,c3,c4=st.columns(4)
+    maxd=int(max(f.DTE.max(skipna=True),u.DTE.max(skipna=True),1)); dte=c1.slider('Max DTE',0,min(maxd,900),60)
+    typ=c2.multiselect('Type',['Call','Put'],default=['Call','Put']); minprem=c3.number_input('Min premium $',0.0,value=0.0,step=10000.0); minvoi=c4.number_input('Min unusual Vol/OI',0.0,value=2.0,step=.5)
+    ff=f[(f.DTE<=dte)&f.Type.isin(typ)&(f.Premium>=minprem)].copy(); uu=u[(u.DTE<=dte)&u.Type.isin(typ)&(u['Vol/OI']>=minvoi)].copy()
+    st.markdown('#### Flow by Strike')
+    fa=ff.groupby(['Strike','Type'],as_index=False).agg(Premium=('Premium','sum'),Volume=('Volume','sum'),Trades=('Strike','size'))
+    fig=go.Figure()
+    for t in typ:
+        z=fa[fa.Type==t]; fig.add_trace(go.Bar(x=z.Strike,y=z.Premium,name=t))
+    fig.add_vline(x=m['spot'],annotation_text='Spot'); fig.update_layout(height=380,title='Premium Concentration',barmode='group',xaxis_title='Strike',yaxis_title='Premium'); st.plotly_chart(fig,use_container_width=True)
+    a,b=st.columns(2)
+    a.markdown('**Largest flow prints**'); a.dataframe(ff.sort_values('Premium',ascending=False).head(30),use_container_width=True,hide_index=True)
+    b.markdown('**Unusual / new-positioning candidates**'); b.dataframe(uu.sort_values('Vol/OI',ascending=False).head(30),use_container_width=True,hide_index=True)
+    st.caption('Mid-market and multi-leg prints are intentionally treated with lower directional confidence in the confluence model.')
 
-em_row = select_expected_move(em, chosen_expiry)
-selected_exp, call_wall, put_wall, gamma_flip, important = build_level_scores(
-    gex_exp, spot, n_expiries=n_exp, half_life_days=half_life, increment=strike_inc
-)
+with T5:
+    strikes=sorted(set(f.Strike.dropna()).union(set(u.Strike.dropna())))
+    default=min(range(len(strikes)),key=lambda i:abs(strikes[i]-m['spot'])) if strikes else 0
+    strike=st.selectbox('Strike',strikes,index=default if strikes else 0)
+    sf=f[f.Strike==strike].copy(); su=u[u.Strike==strike].copy()
+    a,b,c,d=st.columns(4); a.metric('Strike',fmt_price(strike)); b.metric('Distance from spot',f'{(strike/m["spot"]-1):+.2%}'); c.metric('Flow premium',fmt_money(sf.Premium.sum())); d.metric('Max Vol/OI',f'{su["Vol/OI"].max():.1f}x' if len(su) else '—')
+    evid=levels[np.isclose(levels.Level,strike,atol=.26)]
+    if len(evid): st.info(f"**Level context:** {evid.iloc[0].Evidence} • {evid.iloc[0].Classification} • Confluence {evid.iloc[0].Confluence:.0f}/100")
+    left,right=st.columns(2); left.markdown('**Flow at strike**'); left.dataframe(sf.sort_values('Premium',ascending=False),use_container_width=True,hide_index=True); right.markdown('**Unusual activity at strike**'); right.dataframe(su.sort_values('Vol/OI',ascending=False),use_container_width=True,hide_index=True)
 
-upper_em = float(em_row["upper_price"]) if em_row is not None else np.nan
-lower_em = float(em_row["lower_price"]) if em_row is not None else np.nan
-em_amt = float(em_row["expected_move_amt"]) if em_row is not None else np.nan
-em_iv = float(em_row["implied_volatility"]) if em_row is not None else np.nan
-
-# -----------------------------
-# AOI construction
-# -----------------------------
-tol = spot * aoi_pct / 100.0
-
-candidate_rows = [
-    {"Level": lower_em, "Level Type": "Expected Move Lower", "Bias": "BUY", "Base Score": 92},
-    {"Level": put_wall, "Level Type": "Put Wall", "Bias": "BUY", "Base Score": 100},
-    {"Level": upper_em, "Level Type": "Expected Move Upper", "Bias": "SELL", "Base Score": 92},
-    {"Level": call_wall, "Level Type": "Call Wall", "Bias": "SELL", "Base Score": 100},
-    {"Level": gamma_flip, "Level Type": "Gamma Flip", "Bias": "REGIME", "Base Score": 85},
-]
-
-for _, r in important.head(max_imp_levels).iterrows():
-    lvl = float(r["Level"])
-    # Context-sensitive bias: below spot = support candidate, above spot = resistance candidate.
-    bias = "BUY" if lvl < spot else ("SELL" if lvl > spot else "REGIME")
-    candidate_rows.append({
-        "Level": lvl,
-        "Level Type": f"Important Gamma ({r['Types']})",
-        "Bias": bias,
-        "Base Score": min(100, float(r["Importance"])),
-    })
-
-levels = pd.DataFrame(candidate_rows).dropna(subset=["Level"])
-levels["Distance $"] = levels["Level"] - spot
-levels["Distance %"] = 100 * levels["Distance $"] / spot
-levels["AOI Low"] = levels["Level"] - tol
-levels["AOI High"] = levels["Level"] + tol
-levels["In AOI Now"] = (spot >= levels["AOI Low"]) & (spot <= levels["AOI High"])
-
-# Add confluence by clustering nearby levels.
-confluence = []
-for i, r in levels.iterrows():
-    near = levels[(levels["Level"] - r["Level"]).abs() <= tol]
-    confluence.append(len(near))
-levels["Confluence"] = confluence
-levels["AOI Score"] = (
-    levels["Base Score"]
-    + (levels["Confluence"] - 1) * 8
-    - levels["Distance %"].abs().clip(upper=10) * 2
-).clip(0, 100).round(1)
-
-levels["Flag"] = np.where(
-    levels["Bias"].eq("BUY"),
-    "BUY AREA",
-    np.where(levels["Bias"].eq("SELL"), "SELL AREA", "REGIME / PIVOT")
-)
-levels = levels.sort_values(["AOI Score", "Distance %"], ascending=[False, True])
-
-# -----------------------------
-# Headline metrics
-# -----------------------------
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Spot", f"{spot:.2f}", f"{spot_date}")
-c2.metric("Expected Move", f"±{em_amt:.2f}", f"IV {em_iv:.2f}%")
-c3.metric("Gamma Flip", f"{gamma_flip:.2f}" if np.isfinite(gamma_flip) else "—")
-c4.metric("Call Wall", f"{call_wall:.2f}" if np.isfinite(call_wall) else "—")
-c5.metric("Put Wall", f"{put_wall:.2f}" if np.isfinite(put_wall) else "—")
-
-# -----------------------------
-# Candlestick chart
-# -----------------------------
-px = get_price_data(ticker, gex_hist, chart_period)
-
-fig = go.Figure(
-    data=[
-        go.Candlestick(
-            x=px["date"],
-            open=px["Open"],
-            high=px["High"],
-            low=px["Low"],
-            close=px["Close"],
-            name=ticker,
-        )
-    ]
-)
-
-add_hline(fig, upper_em, f"Upper EM {upper_em:.2f}", "dot", 2)
-add_hline(fig, lower_em, f"Lower EM {lower_em:.2f}", "dot", 2)
-add_hline(fig, gamma_flip, f"Gamma Flip {gamma_flip:.2f}", "dash", 2)
-add_hline(fig, call_wall, f"Call Wall {call_wall:.2f}", "solid", 2.5)
-add_hline(fig, put_wall, f"Put Wall {put_wall:.2f}", "solid", 2.5)
-
-core = {round(x, 4) for x in [upper_em, lower_em, gamma_flip, call_wall, put_wall] if np.isfinite(x)}
-for _, r in important.head(max_imp_levels).iterrows():
-    lvl = float(r["Level"])
-    if round(lvl, 4) in core:
-        continue
-    add_hline(fig, lvl, f"Gamma {lvl:.2f} ({r['Importance']:.0f})", "dashdot", 1)
-
-fig.update_layout(
-    title=f"{ticker} — Dealer Positioning Map",
-    xaxis_title="Date",
-    yaxis_title="Price",
-    height=700,
-    xaxis_rangeslider_visible=False,
-    legend_orientation="h",
-)
-
-st.plotly_chart(fig, use_container_width=True)
-
-if yf is None:
-    st.warning("yfinance is not installed. Chart is using close-only fallback candles.")
-elif (px["High"] == px[["Open", "Close"]].max(axis=1)).all():
-    st.warning("Yahoo OHLC data was unavailable, so the chart is using close-only fallback candles.")
-
-# -----------------------------
-# Main dealer-level table
-# -----------------------------
-st.subheader("Dealer levels and areas of interest")
-
-display_cols = [
-    "Flag", "Level Type", "Level", "AOI Low", "AOI High",
-    "Distance $", "Distance %", "Confluence", "AOI Score", "In AOI Now"
-]
-tbl = levels[display_cols].copy()
-for c in ["Level", "AOI Low", "AOI High", "Distance $", "Distance %", "AOI Score"]:
-    tbl[c] = pd.to_numeric(tbl[c], errors="coerce").round(2)
-
-def highlight_flag(row):
-    # Use subtle dataframe highlighting; colors adapt reasonably in Streamlit.
-    if row["Flag"] == "BUY AREA":
-        return ["background-color: rgba(0,160,80,0.13)"] * len(row)
-    if row["Flag"] == "SELL AREA":
-        return ["background-color: rgba(220,60,60,0.13)"] * len(row)
-    return ["background-color: rgba(120,120,120,0.08)"] * len(row)
-
-st.dataframe(tbl.style.apply(highlight_flag, axis=1), use_container_width=True, hide_index=True)
-
-# -----------------------------
-# Important gamma level table
-# -----------------------------
-st.subheader("Important gamma levels")
-if important.empty:
-    st.info("No important gamma clusters could be derived.")
-else:
-    imp_show = important.head(15).copy()
-    imp_show["Distance %"] = ((imp_show["Level"] - spot) / spot * 100).round(2)
-    imp_show["Importance"] = imp_show["Importance"].round(1)
-    imp_show["Side"] = np.where(
-        imp_show["Level"] < spot, "Below spot / support candidate",
-        np.where(imp_show["Level"] > spot, "Above spot / resistance candidate", "At spot")
-    )
-    st.dataframe(imp_show, use_container_width=True, hide_index=True)
-
-# -----------------------------
-# Per-expiration context
-# -----------------------------
-with st.expander("Selected expiration inputs"):
-    exp_show = selected_exp[
-        ["expiration", "net_gex", "call_gex", "put_gex", "call_wall", "put_wall", "gamma_flip", "weight"]
-    ].copy()
-    exp_show["expiration"] = exp_show["expiration"].dt.date
-    exp_show["weight"] = exp_show["weight"].round(4)
-    st.dataframe(exp_show, use_container_width=True, hide_index=True)
-
-# -----------------------------
-# Downloadable summary
-# -----------------------------
-summary_csv = tbl.to_csv(index=False).encode("utf-8")
-st.download_button(
-    "Download dealer-level summary CSV",
-    summary_csv,
-    file_name=f"{ticker}_dealer_positioning_map.csv",
-    mime="text/csv",
-)
-
-st.caption(
-    "AOI flags are decision-support zones, not automatic trade signals. "
-    "BUY areas are levels below/near spot associated with put-wall/lower-EM/gamma support; "
-    "SELL areas are levels above/near spot associated with call-wall/upper-EM/gamma resistance. "
-    "Gamma flip is treated as a regime/pivot level."
-)
+st.divider(); st.caption('Dealer positioning is an analytical map, not a prediction. Flow side and multi-leg prints can be ambiguous; use price/TA confirmation before interpreting a level as support or resistance.')
