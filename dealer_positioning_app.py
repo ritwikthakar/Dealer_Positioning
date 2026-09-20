@@ -200,6 +200,41 @@ with st.sidebar:
     st.header('Data')
     uploads=st.file_uploader('Drop all 6 CSV files',type='csv',accept_multiple_files=True,help='Files are identified automatically from their columns.')
     use_demo=st.toggle('Use bundled COIN files',value=not bool(uploads))
+    st.link_button(
+        "⚡ Convexity Screener",
+        "YOUR_CHEAP_CONVEXITY_APP_URL",
+        use_container_width=True
+    )
+    
+    st.link_button(
+        "🎯 Dealer Positioning",
+        "https://dealerpositioning-n2m58uzu42afb44usojrwe.streamlit.app/",
+        use_container_width=True
+    )
+    
+    st.link_button(
+        "📊 Option Contract Analysis",
+        "https://dealerpositioning-zenvhgc3fs3dcsd9yunvct.streamlit.app/",
+        use_container_width=True
+    )
+    
+    st.link_button(
+        "🔬 Calendar Spread Regime Screening",
+        "https://freedom-fuxffx4ohuuosfojdmffxl.streamlit.app/",
+        use_container_width=True
+    )
+    
+    st.link_button(
+        "📅 Calendar Spread Screener",
+        "https://freedom-hdf89xczpjdheb6kuq2qnz.streamlit.app/",
+        use_container_width=True
+    )
+    
+    st.link_button(
+        "🚀 Option Flow Screener",
+        "https://freedom-4rbsvk5mg32dybsiqwxwna.streamlit.app/",
+        use_container_width=True
+    )
     st.divider(); st.caption('Required: historical option data, GEX by expiration, DEX by expiration, expected move, options flow, unusual activity.')
 
 data=demo_data() if use_demo else load_uploaded(uploads)[0]
