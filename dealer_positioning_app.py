@@ -204,6 +204,31 @@ with st.sidebar:
     em_f = st.file_uploader("Expected move", type="csv")
     dex_exp_f = st.file_uploader("DEX by expiration", type="csv")
     gex_exp_f = st.file_uploader("GEX by expiration", type="csv")
+    st.markdown("### 🔗 Trading Workflow")
+
+    st.link_button(
+        "⚡ Cheap Convexity Screener",
+        "YOUR_CHEAP_CONVEXITY_APP_URL",
+        use_container_width=True
+    )
+    
+    st.link_button(
+        "🎯 Dealer Positioning",
+        "https://dealerpositioning-n2m58uzu42afb44usojrwe.streamlit.app/",
+        use_container_width=True
+    )
+    
+    st.link_button(
+        "📊 Dealer / GEX Analysis",
+        "https://dealerpositioning-zenvhgc3fs3dcsd9yunvct.streamlit.app/",
+        use_container_width=True
+    )
+    
+    st.link_button(
+        "🔬 Option Analysis",
+        "https://freedom-fuxffx4ohuuosfojdmffxl.streamlit.app/",
+        use_container_width=True
+    )
 
     st.divider()
     ticker_input = st.text_input("Ticker override", value="")
