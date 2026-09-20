@@ -16,6 +16,25 @@ st.markdown('''
 .block-container{padding-top:1.1rem;padding-bottom:2rem;max-width:1500px}
 [data-testid="stMetric"]{background:rgba(127,127,127,.07);border:1px solid rgba(127,127,127,.18);padding:12px 14px;border-radius:12px}
 .small-note{opacity:.72;font-size:.86rem}.pill{display:inline-block;padding:3px 9px;border-radius:999px;border:1px solid rgba(127,127,127,.3);margin-right:5px;font-size:.8rem}
+/* Readable command-center cards: don't use st.metric for the top strip because
+   Streamlit truncates long labels/values when six columns are squeezed. */
+.dp-close{display:inline-block;margin:.15rem 0 .9rem 0;padding:.38rem .72rem;border-radius:12px;background:rgba(16,185,129,.12);color:#08783f;font-weight:700;font-size:1rem}
+.dp-grid{display:grid;grid-template-columns:repeat(6,minmax(185px,1fr));gap:14px;margin:.2rem 0 1.15rem 0}
+.dp-card{min-height:238px;border:1px solid rgba(127,127,127,.20);border-radius:18px;padding:20px 20px 16px 20px;box-shadow:0 1px 2px rgba(0,0,0,.02);overflow:visible}
+.dp-card.regime{background:linear-gradient(135deg,rgba(16,185,129,.08),rgba(16,185,129,.025))}
+.dp-card.gex{background:linear-gradient(135deg,rgba(59,130,246,.08),rgba(59,130,246,.025))}
+.dp-card.dex{background:linear-gradient(135deg,rgba(124,58,237,.08),rgba(124,58,237,.025))}
+.dp-card.iv{background:linear-gradient(135deg,rgba(245,158,11,.09),rgba(245,158,11,.025))}
+.dp-card.flip{background:linear-gradient(135deg,rgba(239,68,68,.08),rgba(239,68,68,.025))}
+.dp-card.em{background:linear-gradient(135deg,rgba(20,184,166,.08),rgba(20,184,166,.025))}
+.dp-label{font-size:1.02rem;font-weight:750;line-height:1.25;margin-bottom:18px;white-space:normal}
+.dp-value{font-size:2.15rem;font-weight:760;line-height:1.08;letter-spacing:-.025em;margin-bottom:12px;white-space:normal;overflow-wrap:anywhere}
+.dp-card.regime .dp-value{font-size:1.72rem;color:#08783f}.dp-card.gex .dp-value{color:#174f91}.dp-card.dex .dp-value{color:#4b2796}.dp-card.iv .dp-value{color:#a64d00}.dp-card.flip .dp-value{color:#b5121b}.dp-card.em .dp-value{color:#08783f;font-size:1.82rem}
+.dp-delta{display:inline-block;padding:6px 10px;border-radius:12px;background:rgba(34,197,94,.12);color:#08783f;font-weight:650;font-size:.93rem;margin-bottom:12px;white-space:normal}
+.dp-sub{font-size:.94rem;line-height:1.5;color:rgba(49,61,82,.78);white-space:normal}
+.dp-icon{margin-right:.35rem}
+@media (max-width:1350px){.dp-grid{grid-template-columns:repeat(3,minmax(210px,1fr))}.dp-card{min-height:220px}}
+@media (max-width:760px){.dp-grid{grid-template-columns:1fr}.dp-card{min-height:auto}.dp-value{font-size:2rem}}
 </style>''', unsafe_allow_html=True)
 
 # ---------- Helpers ----------
@@ -193,14 +212,37 @@ ticker=str(f['Symbol'].dropna().iloc[0]) if 'Symbol' in f and f['Symbol'].notna(
 latest_date=h['Date'].max().date() if h['Date'].notna().any() else ''
 
 st.subheader(f'{ticker} • {latest_date}')
-c=st.columns(6)
-c[0].metric('Dealer Regime',m['regime'])
-c[1].metric('Net GEX',fmt_money(m['gex']),fmt_money(m['dg'])+' 1D')
-c[2].metric('Net DEX',fmt_money(m['dex']),fmt_money(m['dd'])+' 1D')
-c[3].metric('IV30 / IV Rank',f"{m['iv']:.1f}% / {m['ivr']:.1f}%")
-c[4].metric('Gamma Flip',fmt_price(m['gamma_flip']),f"Spot {fmt_price(m['spot'])}")
 firstem=em.sort_values('date').iloc[0]
-c[5].metric('Next Expected Move',f"{fmt_price(firstem.lower_price)} – {fmt_price(firstem.upper_price)}",str(firstem.date.date()))
+prev_close=h.iloc[-2]['Close Price'] if len(h)>1 else np.nan
+close_chg=m['spot']-prev_close if pd.notna(prev_close) else np.nan
+close_pct=(close_chg/prev_close) if pd.notna(prev_close) and prev_close else np.nan
+close_badge=f"Close: {fmt_price(m['spot'])}"
+if pd.notna(close_chg): close_badge += f" &nbsp; {'▲' if close_chg>=0 else '▼'} {close_chg:+.2f} ({close_pct:+.2%})"
+st.markdown(f'<div class="dp-close">{close_badge}</div>',unsafe_allow_html=True)
+
+prev_gex=h.iloc[-2]['GEX Net OI'] if len(h)>1 else np.nan
+prev_dex=h.iloc[-2]['DEX Net OI'] if len(h)>1 else np.nan
+g5=(m['gex']-h.iloc[-6]['GEX Net OI']) if len(h)>=6 else np.nan
+d5=(m['dex']-h.iloc[-6]['DEX Net OI']) if len(h)>=6 else np.nan
+reg_parts=m['regime'].split(' — ',1)
+reg_main=reg_parts[0]; reg_detail=reg_parts[1] if len(reg_parts)>1 else 'Transition'
+em_amt=firstem.get('expected_move_amt',np.nan)
+em_pct=firstem.get('expected_move_percentage',np.nan)
+if pd.notna(em_pct) and abs(em_pct)<1: em_pct*=100
+
+def _line(label,val):
+    return f'{label}: {val}' if val not in (None,'') else ''
+
+cards=f'''
+<div class="dp-grid">
+  <div class="dp-card regime"><div class="dp-label"><span class="dp-icon">▥</span>Dealer Regime</div><div class="dp-value">{reg_main}</div><div class="dp-delta">{reg_detail}</div><div class="dp-sub">{'Dealers likely stabilizing price with positive gamma exposure.' if m['gex']>=0 else 'Negative gamma can increase sensitivity to directional price moves.'}</div></div>
+  <div class="dp-card gex"><div class="dp-label"><span class="dp-icon">↗</span>Net GEX</div><div class="dp-value">{fmt_money(m['gex'])}</div><div class="dp-delta">{'↑' if m['dg']>=0 else '↓'} {fmt_money(m['dg'])} (1D)</div><div class="dp-sub">Prev: {fmt_money(prev_gex)}<br>{'5D Change: '+fmt_money(g5) if pd.notna(g5) else ''}</div></div>
+  <div class="dp-card dex"><div class="dp-label"><span class="dp-icon">▤</span>Net DEX</div><div class="dp-value">{fmt_money(m['dex'])}</div><div class="dp-delta">{'↑' if m['dd']>=0 else '↓'} {fmt_money(m['dd'])} (1D)</div><div class="dp-sub">Prev: {fmt_money(prev_dex)}<br>{'5D Change: '+fmt_money(d5) if pd.notna(d5) else ''}</div></div>
+  <div class="dp-card iv"><div class="dp-label"><span class="dp-icon">%</span>IV30 / IV Rank</div><div class="dp-value">{m['iv']:.2f}%</div><div class="dp-delta">IV Rank: {m['ivr']:.2f}%</div><div class="dp-sub">Current 30-day implied volatility and its historical rank.</div></div>
+  <div class="dp-card flip"><div class="dp-label"><span class="dp-icon">⊕</span>Gamma Flip</div><div class="dp-value">{fmt_price(m['gamma_flip'])}</div><div class="dp-delta">Spot: {fmt_price(m['spot'])}</div><div class="dp-sub">Distance: {((m['spot']/m['gamma_flip'])-1):+.1%} ({m['spot']-m['gamma_flip']:+.2f})</div></div>
+  <div class="dp-card em"><div class="dp-label"><span class="dp-icon">▣</span>Next Expected Move</div><div class="dp-value">{fmt_price(firstem.lower_price)} –<br>{fmt_price(firstem.upper_price)}</div><div class="dp-delta">{firstem.date.date()}</div><div class="dp-sub">Range: ± {fmt_price(em_amt).replace('$','')}<br>{f'({em_pct:.2f}%)' if pd.notna(em_pct) else ''}</div></div>
+</div>'''
+st.markdown(cards,unsafe_allow_html=True)
 
 T1,T2,T3,T4,T5=st.tabs(['🎯 Command Center','📈 Historical Regime','🧲 Dealer Positioning','🌊 Flow Intelligence','🔬 Strike Explorer'])
 
