@@ -224,6 +224,30 @@ with st.sidebar:
     max_spread = st.slider("Maximum bid/ask spread %", 1, 100, 20)
     min_dte, max_dte = st.slider("DTE range", 0, 365, (7,90))
     min_score = st.slider("Minimum contract score", 0, 100, 45)
+    st.link_button(
+        "⚡ Cheap Convexity Screener",
+        "YOUR_CHEAP_CONVEXITY_APP_URL",
+        use_container_width=True
+    )
+    
+    st.link_button(
+        "🎯 Dealer Positioning",
+        "https://dealerpositioning-n2m58uzu42afb44usojrwe.streamlit.app/",
+        use_container_width=True
+    )
+    
+    st.link_button(
+        "📊 Dealer / GEX Analysis",
+        "https://dealerpositioning-zenvhgc3fs3dcsd9yunvct.streamlit.app/",
+        use_container_width=True
+    )
+    
+    st.link_button(
+        "🔬 Option Analysis",
+        "https://freedom-fuxffx4ohuuosfojdmffxl.streamlit.app/",
+        use_container_width=True
+    )
+
 
 if upload is None:
     st.info("Upload the new 25-column Barchart export to begin.")
