@@ -225,8 +225,8 @@ with st.sidebar:
     min_dte, max_dte = st.slider("DTE range", 0, 365, (7,90))
     min_score = st.slider("Minimum contract score", 0, 100, 45)
     st.link_button(
-        "⚡ Cheap Convexity Screener",
-        "YOUR_CHEAP_CONVEXITY_APP_URL",
+        "⚡ Convexity Screener",
+        "https://convexity-bqhpmsmhg5lvruwjltk6bl.streamlit.app/",
         use_container_width=True
     )
     
