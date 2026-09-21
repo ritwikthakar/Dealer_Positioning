@@ -122,8 +122,8 @@ with st.sidebar:
     topn=st.slider("Top candidates",5,50,20,5)
     st.markdown("### 🔗 Trading Workflow")
     st.link_button(
-        "⚡ Cheap Convexity Screener",
-        "YOUR_CHEAP_CONVEXITY_APP_URL",
+        "⚡ Convexity Screener",
+        "https://convexity-bqhpmsmhg5lvruwjltk6bl.streamlit.app/",
         use_container_width=True
     )
     
