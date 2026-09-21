@@ -202,7 +202,7 @@ with st.sidebar:
     use_demo=st.toggle('Use bundled COIN files',value=not bool(uploads))
     st.link_button(
         "⚡ Convexity Screener",
-        "YOUR_CHEAP_CONVEXITY_APP_URL",
+        "https://convexity-bqhpmsmhg5lvruwjltk6bl.streamlit.app/",
         use_container_width=True
     )
     
