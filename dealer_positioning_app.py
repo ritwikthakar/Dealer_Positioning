@@ -19,7 +19,7 @@ st.markdown('''
 /* Readable command-center cards: don't use st.metric for the top strip because
    Streamlit truncates long labels/values when six columns are squeezed. */
 .dp-close{display:inline-block;margin:.15rem 0 .9rem 0;padding:.38rem .72rem;border-radius:12px;background:rgba(16,185,129,.12);color:#08783f;font-weight:700;font-size:1rem}
-.dp-grid{display:grid;grid-template-columns:repeat(6,minmax(185px,1fr));gap:14px;margin:.2rem 0 1.15rem 0}
+.dp-grid{display:grid;grid-template-columns:repeat(7,minmax(175px,1fr));gap:14px;margin:.2rem 0 1.15rem 0}
 .dp-card{min-height:238px;border:1px solid rgba(127,127,127,.20);border-radius:18px;padding:20px 20px 16px 20px;box-shadow:0 1px 2px rgba(0,0,0,.02);overflow:visible}
 .dp-card.regime{background:linear-gradient(135deg,rgba(16,185,129,.08),rgba(16,185,129,.025))}
 .dp-card.gex{background:linear-gradient(135deg,rgba(59,130,246,.08),rgba(59,130,246,.025))}
@@ -27,9 +27,10 @@ st.markdown('''
 .dp-card.iv{background:linear-gradient(135deg,rgba(245,158,11,.09),rgba(245,158,11,.025))}
 .dp-card.flip{background:linear-gradient(135deg,rgba(239,68,68,.08),rgba(239,68,68,.025))}
 .dp-card.em{background:linear-gradient(135deg,rgba(20,184,166,.08),rgba(20,184,166,.025))}
+.dp-card.emreg{background:linear-gradient(135deg,rgba(99,102,241,.09),rgba(99,102,241,.025))}
 .dp-label{font-size:1.02rem;font-weight:750;line-height:1.25;margin-bottom:18px;white-space:normal}
 .dp-value{font-size:2.15rem;font-weight:760;line-height:1.08;letter-spacing:-.025em;margin-bottom:12px;white-space:normal;overflow-wrap:anywhere}
-.dp-card.regime .dp-value{font-size:1.72rem;color:#08783f}.dp-card.gex .dp-value{color:#174f91}.dp-card.dex .dp-value{color:#4b2796}.dp-card.iv .dp-value{color:#a64d00}.dp-card.flip .dp-value{color:#b5121b}.dp-card.em .dp-value{color:#08783f;font-size:1.82rem}
+.dp-card.regime .dp-value{font-size:1.72rem;color:#08783f}.dp-card.gex .dp-value{color:#174f91}.dp-card.dex .dp-value{color:#4b2796}.dp-card.iv .dp-value{color:#a64d00}.dp-card.flip .dp-value{color:#b5121b}.dp-card.em .dp-value{color:#08783f;font-size:1.82rem}.dp-card.emreg .dp-value{color:#4338ca;font-size:1.72rem}
 .dp-delta{display:inline-block;padding:6px 10px;border-radius:12px;background:rgba(34,197,94,.12);color:#08783f;font-weight:650;font-size:.93rem;margin-bottom:12px;white-space:normal}
 .dp-sub{font-size:.94rem;line-height:1.5;color:rgba(49,61,82,.78);white-space:normal}
 .dp-icon{margin-right:.35rem}
@@ -116,6 +117,44 @@ def prep(d):
         if c in u:u[c]=u[c].map(num)
     f['Exp Date']=pd.to_datetime(f['Exp Date'],errors='coerce'); u['Exp Date']=pd.to_datetime(u['Exp Date'],errors='coerce')
     return h,g,x,em,f,u
+
+def expected_move_regime(h):
+    """Estimate weekly expected-move containment from IV30 history.
+
+    Uses Friday/last-observation-of-week close as the weekly anchor and
+    EM ~= spot * (IV30/100) / sqrt(52).  This is a regime/context metric,
+    not the expiration-specific ATM-straddle expected move.
+    """
+    z=h[['Date','Close Price','IV 30d']].dropna().copy()
+    if z.empty:
+        return dict(streak=0, hit_rate=np.nan, utilization=np.nan, label='Insufficient history', weekly=pd.DataFrame())
+    z['Date']=pd.to_datetime(z['Date'])
+    z=z.sort_values('Date')
+    z['week']=z['Date'].dt.to_period('W-FRI')
+    # Last available observation in each trading week.
+    w=z.groupby('week',as_index=False).tail(1).copy().sort_values('Date')
+    w['EM']=w['Close Price']*(w['IV 30d']/100.0)/np.sqrt(52)
+    w['Next Close']=w['Close Price'].shift(-1)
+    w['Realized Move']=(w['Next Close']-w['Close Price']).abs()
+    w['EM Utilization']=w['Realized Move']/w['EM'].replace(0,np.nan)
+    w['Inside EM']=w['EM Utilization']<=1
+    completed=w[w['Next Close'].notna()].copy()
+    streak=0
+    for inside in completed['Inside EM'].iloc[::-1]:
+        if bool(inside): streak+=1
+        else: break
+    recent=completed.tail(8)
+    hit_rate=recent['Inside EM'].mean() if len(recent) else np.nan
+    utilization=completed['EM Utilization'].iloc[-1] if len(completed) else np.nan
+    if len(completed)<3:
+        label='Insufficient history'
+    else:
+        util3=completed['EM Utilization'].tail(3).mean()
+        if util3<0.50 and (pd.isna(hit_rate) or hit_rate>=0.75): label='Compression'
+        elif util3<=0.80 and (pd.isna(hit_rate) or hit_rate>=0.625): label='Contained'
+        elif util3<=1.00: label='Testing implied range'
+        else: label='Expansion'
+    return dict(streak=streak, hit_rate=hit_rate, utilization=utilization, label=label, weekly=completed)
 
 def regime_metrics(h,g,x,em,f,u):
     last=h.iloc[-1]; prev=h.iloc[-2] if len(h)>1 else last
@@ -265,6 +304,7 @@ if h_view.empty:
     h_view=h.iloc[[0]].copy()
 actual_date=pd.to_datetime(h_view['Date'].max()).date()
 m=regime_metrics(h_view,g,x,em,f,u); levels=level_table(m,g,x,em,f,u)
+emr=expected_move_regime(h_view)
 
 with header_left:
     st.subheader(f'{ticker} • {actual_date}')
@@ -299,6 +339,7 @@ cards=f'''
   <div class="dp-card iv"><div class="dp-label"><span class="dp-icon">%</span>IV30 / IV Rank</div><div class="dp-value">{m['iv']:.2f}%</div><div class="dp-delta">IV Rank: {m['ivr']:.2f}%</div><div class="dp-sub">Current 30-day implied volatility and its historical rank.</div></div>
   <div class="dp-card flip"><div class="dp-label"><span class="dp-icon">⊕</span>Gamma Flip</div><div class="dp-value">{fmt_price(m['gamma_flip'])}</div><div class="dp-delta">Spot: {fmt_price(m['spot'])}</div><div class="dp-sub">Distance: {((m['spot']/m['gamma_flip'])-1):+.1%} ({m['spot']-m['gamma_flip']:+.2f})</div></div>
   <div class="dp-card em"><div class="dp-label"><span class="dp-icon">▣</span>Next Expected Move</div><div class="dp-value">{fmt_price(firstem.lower_price)} –<br>{fmt_price(firstem.upper_price)}</div><div class="dp-delta">{firstem.date.date()}</div><div class="dp-sub">Range: ± {fmt_price(em_amt).replace('$','')}<br>{f'({em_pct:.2f}%)' if pd.notna(em_pct) else ''}</div></div>
+  <div class="dp-card emreg"><div class="dp-label"><span class="dp-icon">↔</span>EM Regime</div><div class="dp-value">{emr['label']}</div><div class="dp-delta">{emr['streak']} consecutive weeks inside EM</div><div class="dp-sub">8W containment: {f"{emr['hit_rate']:.0%}" if pd.notna(emr['hit_rate']) else '—'}<br>Latest utilization: {f"{emr['utilization']:.2f}x" if pd.notna(emr['utilization']) else '—'}</div></div>
 </div>'''
 st.markdown(cards,unsafe_allow_html=True)
 
@@ -309,6 +350,22 @@ with T1:
     a.metric('Stability Score',f"{m['stability']:.0f}/100",help='Higher = more stabilizing dealer backdrop based on GEX sign/trend and distance from gamma flip.')
     b.metric('Directional Pressure',f"{m['pressure']:.0f}/100",help='Descriptive pressure index. Above 50 = more positive delta/call-side pressure; below 50 = more negative/put-side pressure. Not a trade signal.')
     c.info(f"**Map:** Put wall {fmt_price(m['put_wall'])} • Call wall {fmt_price(m['call_wall'])} • Gamma flip {fmt_price(m['gamma_flip'])} • Max pain {fmt_price(m['maxpain'])}")
+
+    st.markdown('#### Expected Move Regime')
+    e1,e2,e3,e4=st.columns(4)
+    e1.metric('Consecutive Weeks Inside EM',emr['streak'],help='Completed weekly observations whose absolute close-to-close move stayed within the IV30-derived weekly expected move.')
+    e2.metric('8W Containment',f"{emr['hit_rate']:.0%}" if pd.notna(emr['hit_rate']) else '—')
+    e3.metric('Latest EM Utilization',f"{emr['utilization']:.2f}x" if pd.notna(emr['utilization']) else '—',help='Absolute weekly close-to-close move divided by the weekly IV30-derived expected move.')
+    e4.metric('EM Regime',emr['label'])
+    st.caption('Weekly EM is estimated as spot × IV30 / √52. Streak length is context, not a breakout timer; use it with GEX, gamma flip and realized-range behavior.')
+    if len(emr['weekly']):
+        ew=emr['weekly'].tail(12).copy()
+        ew['Week']=ew['Date'].dt.date
+        ew['Expected Move']=ew['EM'].map(lambda v:f'±{v:,.1f}')
+        ew['Realized Move']=ew['Realized Move'].map(lambda v:f'{v:,.1f}')
+        ew['EM Utilization']=ew['EM Utilization'].map(lambda v:f'{v:.2f}x')
+        ew['Inside EM']=ew['Inside EM'].map(lambda v:'Yes' if v else 'No')
+        st.dataframe(ew[['Week','Close Price','Expected Move','Realized Move','EM Utilization','Inside EM']],use_container_width=True,hide_index=True)
 
     st.markdown('#### Areas of Interest')
     ao=levels.copy()
