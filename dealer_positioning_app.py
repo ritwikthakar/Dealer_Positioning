@@ -19,7 +19,7 @@ st.markdown('''
 /* Readable command-center cards: don't use st.metric for the top strip because
    Streamlit truncates long labels/values when six columns are squeezed. */
 .dp-close{display:inline-block;margin:.15rem 0 .9rem 0;padding:.38rem .72rem;border-radius:12px;background:rgba(16,185,129,.12);color:#08783f;font-weight:700;font-size:1rem}
-.dp-grid{display:grid;grid-template-columns:repeat(7,minmax(175px,1fr));gap:14px;margin:.2rem 0 1.15rem 0}
+.dp-grid{display:grid;grid-template-columns:repeat(6,minmax(185px,1fr));gap:14px;margin:.2rem 0 1.15rem 0}
 .dp-card{min-height:238px;border:1px solid rgba(127,127,127,.20);border-radius:18px;padding:20px 20px 16px 20px;box-shadow:0 1px 2px rgba(0,0,0,.02);overflow:visible}
 .dp-card.regime{background:linear-gradient(135deg,rgba(16,185,129,.08),rgba(16,185,129,.025))}
 .dp-card.gex{background:linear-gradient(135deg,rgba(59,130,246,.08),rgba(59,130,246,.025))}
@@ -34,6 +34,14 @@ st.markdown('''
 .dp-delta{display:inline-block;padding:6px 10px;border-radius:12px;background:rgba(34,197,94,.12);color:#08783f;font-weight:650;font-size:.93rem;margin-bottom:12px;white-space:normal}
 .dp-sub{font-size:.94rem;line-height:1.5;color:rgba(49,61,82,.78);white-space:normal}
 .dp-icon{margin-right:.35rem}
+.emr-grid{display:grid;grid-template-columns:repeat(4,minmax(210px,1fr));gap:16px;margin:.5rem 0 1rem 0}
+.emr-card{min-height:190px;border:1px solid rgba(127,127,127,.20);border-radius:18px;padding:20px;background:rgba(127,127,127,.045);overflow:visible}
+.emr-label{font-size:1rem;font-weight:750;line-height:1.3;margin-bottom:18px;white-space:normal}
+.emr-value{font-size:2.35rem;font-weight:760;line-height:1.08;letter-spacing:-.025em;margin-bottom:14px;white-space:normal;overflow-wrap:anywhere}
+.emr-value.emr-regime{font-size:1.75rem}
+.emr-sub{font-size:.9rem;line-height:1.45;color:rgba(49,61,82,.78);white-space:normal}
+@media (max-width:1100px){.emr-grid{grid-template-columns:repeat(2,minmax(220px,1fr))}}
+@media (max-width:650px){.emr-grid{grid-template-columns:1fr}.emr-card{min-height:auto}}
 @media (max-width:1350px){.dp-grid{grid-template-columns:repeat(3,minmax(210px,1fr))}.dp-card{min-height:220px}}
 @media (max-width:760px){.dp-grid{grid-template-columns:1fr}.dp-card{min-height:auto}.dp-value{font-size:2rem}}
 </style>''', unsafe_allow_html=True)
@@ -339,33 +347,16 @@ cards=f'''
   <div class="dp-card iv"><div class="dp-label"><span class="dp-icon">%</span>IV30 / IV Rank</div><div class="dp-value">{m['iv']:.2f}%</div><div class="dp-delta">IV Rank: {m['ivr']:.2f}%</div><div class="dp-sub">Current 30-day implied volatility and its historical rank.</div></div>
   <div class="dp-card flip"><div class="dp-label"><span class="dp-icon">⊕</span>Gamma Flip</div><div class="dp-value">{fmt_price(m['gamma_flip'])}</div><div class="dp-delta">Spot: {fmt_price(m['spot'])}</div><div class="dp-sub">Distance: {((m['spot']/m['gamma_flip'])-1):+.1%} ({m['spot']-m['gamma_flip']:+.2f})</div></div>
   <div class="dp-card em"><div class="dp-label"><span class="dp-icon">▣</span>Next Expected Move</div><div class="dp-value">{fmt_price(firstem.lower_price)} –<br>{fmt_price(firstem.upper_price)}</div><div class="dp-delta">{firstem.date.date()}</div><div class="dp-sub">Range: ± {fmt_price(em_amt).replace('$','')}<br>{f'({em_pct:.2f}%)' if pd.notna(em_pct) else ''}</div></div>
-  <div class="dp-card emreg"><div class="dp-label"><span class="dp-icon">↔</span>EM Regime</div><div class="dp-value">{emr['label']}</div><div class="dp-delta">{emr['streak']} consecutive weeks inside EM</div><div class="dp-sub">8W containment: {f"{emr['hit_rate']:.0%}" if pd.notna(emr['hit_rate']) else '—'}<br>Latest utilization: {f"{emr['utilization']:.2f}x" if pd.notna(emr['utilization']) else '—'}</div></div>
 </div>'''
 st.markdown(cards,unsafe_allow_html=True)
 
-T1,T2,T3,T4,T5=st.tabs(['🎯 Command Center','📈 Historical Regime','🧲 Dealer Positioning','🌊 Flow Intelligence','🔬 Strike Explorer'])
+T1,T2,T3,T4,T5,T6=st.tabs(['🎯 Command Center','↔ Expected Move Regime','📈 Historical Regime','🧲 Dealer Positioning','🌊 Flow Intelligence','🔬 Strike Explorer'])
 
 with T1:
     a,b,c=st.columns([1,1,2])
     a.metric('Stability Score',f"{m['stability']:.0f}/100",help='Higher = more stabilizing dealer backdrop based on GEX sign/trend and distance from gamma flip.')
     b.metric('Directional Pressure',f"{m['pressure']:.0f}/100",help='Descriptive pressure index. Above 50 = more positive delta/call-side pressure; below 50 = more negative/put-side pressure. Not a trade signal.')
     c.info(f"**Map:** Put wall {fmt_price(m['put_wall'])} • Call wall {fmt_price(m['call_wall'])} • Gamma flip {fmt_price(m['gamma_flip'])} • Max pain {fmt_price(m['maxpain'])}")
-
-    st.markdown('#### Expected Move Regime')
-    e1,e2,e3,e4=st.columns(4)
-    e1.metric('Consecutive Weeks Inside EM',emr['streak'],help='Completed weekly observations whose absolute close-to-close move stayed within the IV30-derived weekly expected move.')
-    e2.metric('8W Containment',f"{emr['hit_rate']:.0%}" if pd.notna(emr['hit_rate']) else '—')
-    e3.metric('Latest EM Utilization',f"{emr['utilization']:.2f}x" if pd.notna(emr['utilization']) else '—',help='Absolute weekly close-to-close move divided by the weekly IV30-derived expected move.')
-    e4.metric('EM Regime',emr['label'])
-    st.caption('Weekly EM is estimated as spot × IV30 / √52. Streak length is context, not a breakout timer; use it with GEX, gamma flip and realized-range behavior.')
-    if len(emr['weekly']):
-        ew=emr['weekly'].tail(12).copy()
-        ew['Week']=ew['Date'].dt.date
-        ew['Expected Move']=ew['EM'].map(lambda v:f'±{v:,.1f}')
-        ew['Realized Move']=ew['Realized Move'].map(lambda v:f'{v:,.1f}')
-        ew['EM Utilization']=ew['EM Utilization'].map(lambda v:f'{v:.2f}x')
-        ew['Inside EM']=ew['Inside EM'].map(lambda v:'Yes' if v else 'No')
-        st.dataframe(ew[['Week','Close Price','Expected Move','Realized Move','EM Utilization','Inside EM']],use_container_width=True,hide_index=True)
 
     st.markdown('#### Areas of Interest')
     ao=levels.copy()
@@ -392,6 +383,29 @@ with T1:
     st.plotly_chart(fig,use_container_width=True)
 
 with T2:
+    st.markdown('#### Expected Move Regime')
+    st.caption('Weekly expected-move containment and utilization. Use this as volatility-regime context alongside GEX and the gamma flip—not as a breakout timer.')
+    hit_txt=f"{emr['hit_rate']:.0%}" if pd.notna(emr['hit_rate']) else '—'
+    util_txt=f"{emr['utilization']:.2f}x" if pd.notna(emr['utilization']) else '—'
+    em_cards=f'''<div class="emr-grid">
+      <div class="emr-card"><div class="emr-label">Consecutive Weeks Inside EM</div><div class="emr-value">{emr['streak']}</div><div class="emr-sub">Completed weeks contained within the IV30-derived expected move.</div></div>
+      <div class="emr-card"><div class="emr-label">8-Week Containment</div><div class="emr-value">{hit_txt}</div><div class="emr-sub">Share of the latest eight completed weeks that remained inside expected move.</div></div>
+      <div class="emr-card"><div class="emr-label">Latest EM Utilization</div><div class="emr-value">{util_txt}</div><div class="emr-sub">Absolute weekly close-to-close move ÷ expected move.</div></div>
+      <div class="emr-card"><div class="emr-label">Expected Move Regime</div><div class="emr-value emr-regime">{emr['label']}</div><div class="emr-sub">Current classification from recent realized-move utilization.</div></div>
+    </div>'''
+    st.markdown(em_cards,unsafe_allow_html=True)
+    st.caption('Weekly EM is estimated as spot × IV30 / √52. Streak length is context; combine it with GEX, gamma flip and realized-range behavior.')
+    if len(emr['weekly']):
+        ew=emr['weekly'].tail(12).copy()
+        ew['Week']=ew['Date'].dt.date
+        ew['Close Price']=ew['Close Price'].map(lambda v:f'{v:,.2f}')
+        ew['Expected Move']=ew['EM'].map(lambda v:f'±{v:,.1f}')
+        ew['Realized Move']=ew['Realized Move'].map(lambda v:f'{v:,.1f}')
+        ew['EM Utilization']=ew['EM Utilization'].map(lambda v:f'{v:.2f}x')
+        ew['Inside EM']=ew['Inside EM'].map(lambda v:'Yes' if v else 'No')
+        st.dataframe(ew[['Week','Close Price','Expected Move','Realized Move','EM Utilization','Inside EM']],use_container_width=True,hide_index=True,height=455)
+
+with T3:
     days=st.segmented_control('Window',['20D','60D','All'],default='60D')
     hh=h.tail(20 if days=='20D' else 60 if days=='60D' else len(h))
     fig=go.Figure(); fig.add_trace(go.Scatter(x=hh.Date,y=hh['Close Price'],name='Close')); fig.add_trace(go.Scatter(x=hh.Date,y=hh['Max Pain 1d'],name='Max Pain',line=dict(dash='dot'))); fig.update_layout(height=350,title='Price vs Max Pain'); st.plotly_chart(fig,use_container_width=True)
@@ -400,7 +414,7 @@ with T2:
         fig=go.Figure(go.Bar(x=hh.Date,y=hh[y],name=y)); fig.add_hline(y=0); fig.update_layout(height=330,title=title); col.plotly_chart(fig,use_container_width=True)
     fig=go.Figure(); fig.add_trace(go.Scatter(x=hh.Date,y=hh['IV 30d'],name='IV30')); fig.add_trace(go.Scatter(x=hh.Date,y=hh['IV Rank'],name='IV Rank')); fig.update_layout(height=330,title='Volatility Regime'); st.plotly_chart(fig,use_container_width=True)
 
-with T3:
+with T4:
     pos=pd.merge(g,x,on='expiration_dt',how='outer',suffixes=('_gex','_dex')).sort_values('expiration_dt')
     pos['GEX Share']=pos.net_gex.abs()/max(pos.net_gex.abs().sum(),1); pos['DEX Share']=pos.net_dex.abs()/max(pos.net_dex.abs().sum(),1)
     analysis_date=pd.Timestamp(actual_date).normalize()
@@ -424,7 +438,7 @@ with T3:
     fig=go.Figure(go.Bar(x=filt.expiration_dt,y=filt.net_gex)); fig.add_hline(y=0); fig.update_layout(height=350,title='Net GEX by Expiration'); col1.plotly_chart(fig,use_container_width=True)
     fig=go.Figure(go.Bar(x=filt.expiration_dt,y=filt.net_dex)); fig.add_hline(y=0); fig.update_layout(height=350,title='Net DEX by Expiration'); col2.plotly_chart(fig,use_container_width=True)
 
-with T4:
+with T5:
     c1,c2,c3,c4=st.columns(4)
     maxd=int(max(f.DTE.max(skipna=True),u.DTE.max(skipna=True),1)); dte=c1.slider('Max DTE',0,min(maxd,900),60)
     typ=c2.multiselect('Type',['Call','Put'],default=['Call','Put']); minprem=c3.number_input('Min premium $',0.0,value=0.0,step=10000.0); minvoi=c4.number_input('Min unusual Vol/OI',0.0,value=2.0,step=.5)
@@ -440,7 +454,7 @@ with T4:
     b.markdown('**Unusual / new-positioning candidates**'); b.dataframe(uu.sort_values('Vol/OI',ascending=False).head(30),use_container_width=True,hide_index=True)
     st.caption('Mid-market and multi-leg prints are intentionally treated with lower directional confidence in the confluence model.')
 
-with T5:
+with T6:
     strikes=sorted(set(f.Strike.dropna()).union(set(u.Strike.dropna())))
     default=min(range(len(strikes)),key=lambda i:abs(strikes[i]-m['spot'])) if strikes else 0
     strike=st.selectbox('Strike',strikes,index=default if strikes else 0)
