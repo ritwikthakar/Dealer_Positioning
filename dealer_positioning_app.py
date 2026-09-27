@@ -44,6 +44,16 @@ st.markdown('''
 @media (max-width:650px){.emr-grid{grid-template-columns:1fr}.emr-card{min-height:auto}}
 @media (max-width:1350px){.dp-grid{grid-template-columns:repeat(3,minmax(210px,1fr))}.dp-card{min-height:220px}}
 @media (max-width:760px){.dp-grid{grid-template-columns:1fr}.dp-card{min-height:auto}.dp-value{font-size:2rem}}
+/* Calendar Regime Engine cards */
+.cre-grid{display:grid;grid-template-columns:repeat(4,minmax(220px,1fr));gap:16px;margin:.6rem 0 1.15rem 0}
+.cre-card{min-height:180px;border:1px solid rgba(127,127,127,.20);border-radius:18px;padding:20px;background:rgba(127,127,127,.045);overflow:visible}
+.cre-label{font-size:1rem;font-weight:750;line-height:1.3;margin-bottom:16px;white-space:normal}
+.cre-value{font-size:1.72rem;font-weight:760;line-height:1.18;letter-spacing:-.02em;margin-bottom:12px;white-space:normal;overflow-wrap:anywhere;word-break:normal}
+.cre-value.price{font-size:2rem}
+.cre-sub{font-size:.9rem;line-height:1.45;color:rgba(49,61,82,.78);white-space:normal}
+.cre-badge{display:inline-block;padding:5px 9px;border-radius:999px;background:rgba(34,197,94,.12);color:#08783f;font-weight:650;font-size:.88rem;margin-top:3px}
+@media (max-width:1150px){.cre-grid{grid-template-columns:repeat(2,minmax(240px,1fr))}}
+@media (max-width:650px){.cre-grid{grid-template-columns:1fr}.cre-card{min-height:auto}}
 </style>''', unsafe_allow_html=True)
 
 # ---------- Helpers ----------
@@ -424,16 +434,19 @@ with T1:
 with T2:
     st.markdown('#### 🧭 Calendar Regime Engine')
     st.caption('Classifies the six-file setup into the calendar regime playbook. Directional expansion still requires price/TA confirmation.')
-    a,b,c,d=st.columns(4)
-    a.metric('Current Regime',cre['regime'])
-    b.metric('Preferred Structure',cre['strategy'])
-    c.metric('Dealer Magnet',fmt_price(cre['magnet']),f"{cre['share']:.0%} cluster share")
-    d.metric('Transition Risk',f"{cre['transition']:.0f}/100")
-    a,b,c,d=st.columns(4)
-    a.metric('Lower Boundary',fmt_price(cre['lower']))
-    b.metric('Upper Boundary',fmt_price(cre['upper']))
-    c.metric('Boundary Credibility',f"{cre['boundary']:.0f}/100")
-    d.metric('EM Regime',emr['label'])
+    regime_cards=f"""
+    <div class="cre-grid">
+      <div class="cre-card"><div class="cre-label">Current Regime</div><div class="cre-value">{cre['regime']}</div><div class="cre-sub">Calendar regime classification from EM, dealer clustering and transition inputs.</div></div>
+      <div class="cre-card"><div class="cre-label">Preferred Structure</div><div class="cre-value">{cre['strategy']}</div><div class="cre-sub">Structure associated with the detected regime.</div></div>
+      <div class="cre-card"><div class="cre-label">Dealer Magnet</div><div class="cre-value price">{fmt_price(cre['magnet'])}</div><div class="cre-badge">↑ {cre['share']:.0%} cluster share</div></div>
+      <div class="cre-card"><div class="cre-label">Transition Risk</div><div class="cre-value price">{cre['transition']:.0f}/100</div><div class="cre-sub">Higher readings indicate increasing risk of leaving the current regime.</div></div>
+      <div class="cre-card"><div class="cre-label">Lower Boundary</div><div class="cre-value price">{fmt_price(cre['lower'])}</div><div class="cre-sub">Lower dealer-positioning boundary detected by the engine.</div></div>
+      <div class="cre-card"><div class="cre-label">Upper Boundary</div><div class="cre-value price">{fmt_price(cre['upper'])}</div><div class="cre-sub">Upper dealer-positioning boundary detected by the engine.</div></div>
+      <div class="cre-card"><div class="cre-label">Boundary Credibility</div><div class="cre-value price">{cre['boundary']:.0f}/100</div><div class="cre-sub">Strength of evidence supporting the detected range boundaries.</div></div>
+      <div class="cre-card"><div class="cre-label">EM Regime</div><div class="cre-value">{emr['label']}</div><div class="cre-sub">Current expected-move containment classification.</div></div>
+    </div>
+    """
+    st.markdown(regime_cards,unsafe_allow_html=True)
     st.markdown('##### Regime Playbook')
     play=pd.DataFrame([['Compression — Single Magnet','ATM calendar','Dealer/max-pain levels cluster around one strike'],['Compression — Defined Range','Double calendar','Credible lower and upper dealer boundaries'],['Transition','Reduce / stop new calendars','EM/IV acceleration and weakening gamma'],['Expansion','OTM directional calendar / diagonal','Use price/TA to confirm direction']],columns=['Regime','Structure','Confirmation'])
     st.dataframe(play,use_container_width=True,hide_index=True)
