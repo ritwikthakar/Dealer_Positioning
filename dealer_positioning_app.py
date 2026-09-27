@@ -216,15 +216,42 @@ def calendar_regime_engine(h,g,x,m,emr):
     tol=max(spot*.004,5); magnet=np.nan; share=0
     if len(lv):
         cand=np.unique(np.round(lv*2)/2); counts=[np.sum(np.abs(lv-c)<=tol) for c in cand]; j=int(np.argmax(counts)); magnet=float(cand[j]); share=float(counts[j]/len(lv))
-    lows=[]; highs=[]
+    # A defined range must have TWO boundaries that are genuinely distinct from
+    # the central dealer magnet.  Previously a 7700 magnet could also be counted
+    # as the lower boundary, incorrectly turning "7700 magnet + 7800 resistance"
+    # into a double-calendar regime.
+    boundary_levels=[]
     for df in (gs,xs):
         for _,r in df.iterrows():
             for c in ['call_wall','put_wall']:
                 v=r.get(c,np.nan)
-                if pd.notna(v): (lows if v<spot else highs).append(float(v))
-    lower=np.nanmedian(lows) if lows else np.nan; upper=np.nanmedian(highs) if highs else np.nan
-    bscore=min(100,12.5*(len(lows)+len(highs))); width=(upper-lower)/spot if pd.notna(lower) and pd.notna(upper) else np.nan
-    two=pd.notna(width) and width>=.012 and bscore>=50
+                if pd.notna(v): boundary_levels.append(float(v))
+
+    # Require each boundary to sit outside the magnet cluster.  0.50% of spot is
+    # deliberately a little stricter than the 0.40% magnet-clustering tolerance.
+    distinct_gap=max(spot*.005, tol*1.15, 10)
+    lows=[]; highs=[]
+    for v in boundary_levels:
+        anchor=magnet if pd.notna(magnet) else spot
+        if v <= anchor-distinct_gap: lows.append(v)
+        elif v >= anchor+distinct_gap: highs.append(v)
+
+    # Use the median of repeated wall observations on each side; repeated
+    # expirations agreeing on a level increase credibility rather than creating
+    # a second boundary at the magnet itself.
+    lower=np.nanmedian(lows) if lows else np.nan
+    upper=np.nanmedian(highs) if highs else np.nan
+    lower_n=len(lows); upper_n=len(highs)
+    side_balance=min(lower_n,upper_n)
+    bscore=min(100,25*side_balance) if side_balance else 0
+    width=(upper-lower)/spot if pd.notna(lower) and pd.notna(upper) else np.nan
+
+    # Double calendar requires: both distinct sides, meaningful total width, and
+    # neither boundary overlapping the dealer magnet.
+    distinct_from_magnet=(pd.notna(magnet) and pd.notna(lower) and pd.notna(upper)
+                          and (magnet-lower)>=distinct_gap
+                          and (upper-magnet)>=distinct_gap)
+    two=bool(distinct_from_magnet and pd.notna(width) and width>=.012 and bscore>=50)
     vals=lambda names:[num(last.get(c)) for c in names if c in h.columns and pd.notna(last.get(c))]
     short=vals(['IV 1d','IV 3d','IV 7d']); mid=vals(['IV 7d','IV 14d','IV 21d','IV 30d'])
     iva=(np.nanmean(short)/np.nanmean(mid)-1) if short and mid and np.nanmean(mid) else np.nan
@@ -241,7 +268,7 @@ def calendar_regime_engine(h,g,x,m,emr):
     elif compression and two: reg,strat='COMPRESSION — DEFINED RANGE','Double calendar'
     elif compression: reg,strat='COMPRESSION — MIXED STRUCTURE','ATM calendar / wait for clearer walls'
     else: reg,strat='NEUTRAL / UNRESOLVED','Wait for confirmation'
-    return dict(regime=reg,strategy=strat,magnet=magnet,share=share,lower=lower,upper=upper,boundary=bscore,transition=min(100,ts),ivacc=iva,gexmom=gm)
+    return dict(regime=reg,strategy=strat,magnet=magnet,share=share,lower=lower,upper=upper,boundary=bscore,transition=min(100,ts),ivacc=iva,gexmom=gm,distinct_gap=distinct_gap,two_boundary=two)
 
 def level_table(m,g,x,em,f,u):
     spot=m['spot']; rows=defaultdict(lambda:{'score':0,'evidence':[],'flow_premium':0,'unusual':0})
