@@ -109,8 +109,8 @@ def demo_data():
 
 def prep(d):
     h=d['history'].copy(); h['Date']=pd.to_datetime(h['Date'],errors='coerce')
-    for c in ['Close Price','Option Volume Total','Option Volume Put-Call Ratio','OI Total','OI Put-Call Ratio','IV 30d','IV Rank','Max Pain 1d','GEX Net OI','DEX Net OI']:
-        if c in h: h[c]=h[c].map(num)
+    hist_numeric=[c for c in h.columns if (c in ['Close Price','Option Volume Total','Option Volume Put-Call Ratio','OI Total','OI Put-Call Ratio','IV Rank','Total Option Contracts','Call Volume','Put Volume','Call OI','Put OI'] or c.startswith(('IV ','Max Pain','GEX ','DEX ')))]
+    for c in hist_numeric: h[c]=h[c].map(num)
     h=h.sort_values('Date')
     g=d['gex'].copy(); x=d['dex'].copy()
     g['expiration_dt']=pd.to_datetime(g['expiration'],errors='coerce'); x['expiration_dt']=pd.to_datetime(x['expiration'],errors='coerce')
@@ -194,6 +194,44 @@ def regime_metrics(h,g,x,em,f,u):
     pressure=zclip(pressure)
     return dict(spot=spot,gex=gex,dex=dex,dg=dg,dd=dd,iv=iv,ivr=ivr,regime=reg,stability=stability,pressure=pressure,
                 gamma_flip=gr.get('gamma_flip',np.nan),call_wall=gr.get('call_wall',np.nan),put_wall=gr.get('put_wall',np.nan),maxpain=last.get('Max Pain 1d',np.nan))
+
+def calendar_regime_engine(h,g,x,m,emr):
+    last=h.iloc[-1]; spot=m['spot']
+    mp=[num(last.get(c)) for c in h.columns if c.startswith('Max Pain') and pd.notna(last.get(c))]
+    gs=g.sort_values('expiration_dt').head(4); xs=x.sort_values('expiration_dt').head(4)
+    lv=[]
+    for _,r in gs.iterrows(): lv += [r.get('call_wall'),r.get('put_wall'),r.get('gamma_flip')]
+    for _,r in xs.iterrows(): lv += [r.get('call_wall'),r.get('put_wall')]
+    lv=np.array([float(v) for v in lv+mp if pd.notna(v)])
+    tol=max(spot*.004,5); magnet=np.nan; share=0
+    if len(lv):
+        cand=np.unique(np.round(lv*2)/2); counts=[np.sum(np.abs(lv-c)<=tol) for c in cand]; j=int(np.argmax(counts)); magnet=float(cand[j]); share=float(counts[j]/len(lv))
+    lows=[]; highs=[]
+    for df in (gs,xs):
+        for _,r in df.iterrows():
+            for c in ['call_wall','put_wall']:
+                v=r.get(c,np.nan)
+                if pd.notna(v): (lows if v<spot else highs).append(float(v))
+    lower=np.nanmedian(lows) if lows else np.nan; upper=np.nanmedian(highs) if highs else np.nan
+    bscore=min(100,12.5*(len(lows)+len(highs))); width=(upper-lower)/spot if pd.notna(lower) and pd.notna(upper) else np.nan
+    two=pd.notna(width) and width>=.012 and bscore>=50
+    vals=lambda names:[num(last.get(c)) for c in names if c in h.columns and pd.notna(last.get(c))]
+    short=vals(['IV 1d','IV 3d','IV 7d']); mid=vals(['IV 7d','IV 14d','IV 21d','IV 30d'])
+    iva=(np.nanmean(short)/np.nanmean(mid)-1) if short and mid and np.nanmean(mid) else np.nan
+    g5=m['gex']-h.iloc[-6].get('GEX Net OI',m['gex']) if len(h)>=6 else np.nan
+    scale=max(h['GEX Net OI'].abs().quantile(.75),1); gm=g5/scale if pd.notna(g5) else np.nan
+    util=emr.get('utilization',np.nan); ts=0
+    ts += 25 if pd.notna(util) and util>=.8 else (12 if pd.notna(util) and util>=.6 else 0)
+    ts += 20 if pd.notna(iva) and iva>.08 else (10 if pd.notna(iva) and iva>0 else 0)
+    ts += 20 if pd.notna(gm) and gm<-.35 else (10 if pd.notna(gm) and gm<0 else 0); ts += 20 if m['gex']<0 else 0
+    compression=emr.get('label') in ['Compression','Contained']; expansion=emr.get('label')=='Expansion' or (pd.notna(util) and util>1)
+    if expansion: reg,strat='EXPANSION','OTM directional calendar / diagonal'
+    elif ts>=50 or emr.get('label')=='Testing implied range': reg,strat='TRANSITION','Reduce / stop new calendars'
+    elif compression and share>=.45 and not two: reg,strat='COMPRESSION — SINGLE MAGNET','ATM calendar'
+    elif compression and two: reg,strat='COMPRESSION — DEFINED RANGE','Double calendar'
+    elif compression: reg,strat='COMPRESSION — MIXED STRUCTURE','ATM calendar / wait for clearer walls'
+    else: reg,strat='NEUTRAL / UNRESOLVED','Wait for confirmation'
+    return dict(regime=reg,strategy=strat,magnet=magnet,share=share,lower=lower,upper=upper,boundary=bscore,transition=min(100,ts),ivacc=iva,gexmom=gm)
 
 def level_table(m,g,x,em,f,u):
     spot=m['spot']; rows=defaultdict(lambda:{'score':0,'evidence':[],'flow_premium':0,'unusual':0})
@@ -313,6 +351,7 @@ if h_view.empty:
 actual_date=pd.to_datetime(h_view['Date'].max()).date()
 m=regime_metrics(h_view,g,x,em,f,u); levels=level_table(m,g,x,em,f,u)
 emr=expected_move_regime(h_view)
+cre=calendar_regime_engine(h_view,g,x,m,emr)
 
 with header_left:
     st.subheader(f'{ticker} • {actual_date}')
@@ -350,7 +389,7 @@ cards=f'''
 </div>'''
 st.markdown(cards,unsafe_allow_html=True)
 
-T1,T2,T3,T4,T5,T6=st.tabs(['🎯 Command Center','↔ Expected Move Regime','📈 Historical Regime','🧲 Dealer Positioning','🌊 Flow Intelligence','🔬 Strike Explorer'])
+T1,T2,T3,T4,T5,T6,T7=st.tabs(['🎯 Command Center','🧭 Calendar Regime Engine','↔ Expected Move Regime','📈 Historical Regime','🧲 Dealer Positioning','🌊 Flow Intelligence','🔬 Strike Explorer'])
 
 with T1:
     a,b,c=st.columns([1,1,2])
@@ -383,6 +422,28 @@ with T1:
     st.plotly_chart(fig,use_container_width=True)
 
 with T2:
+    st.markdown('#### 🧭 Calendar Regime Engine')
+    st.caption('Classifies the six-file setup into the calendar regime playbook. Directional expansion still requires price/TA confirmation.')
+    a,b,c,d=st.columns(4)
+    a.metric('Current Regime',cre['regime'])
+    b.metric('Preferred Structure',cre['strategy'])
+    c.metric('Dealer Magnet',fmt_price(cre['magnet']),f"{cre['share']:.0%} cluster share")
+    d.metric('Transition Risk',f"{cre['transition']:.0f}/100")
+    a,b,c,d=st.columns(4)
+    a.metric('Lower Boundary',fmt_price(cre['lower']))
+    b.metric('Upper Boundary',fmt_price(cre['upper']))
+    c.metric('Boundary Credibility',f"{cre['boundary']:.0f}/100")
+    d.metric('EM Regime',emr['label'])
+    st.markdown('##### Regime Playbook')
+    play=pd.DataFrame([['Compression — Single Magnet','ATM calendar','Dealer/max-pain levels cluster around one strike'],['Compression — Defined Range','Double calendar','Credible lower and upper dealer boundaries'],['Transition','Reduce / stop new calendars','EM/IV acceleration and weakening gamma'],['Expansion','OTM directional calendar / diagonal','Use price/TA to confirm direction']],columns=['Regime','Structure','Confirmation'])
+    st.dataframe(play,use_container_width=True,hide_index=True)
+    st.markdown('##### Diagnostics')
+    ivtxt='—' if pd.isna(cre['ivacc']) else f"{cre['ivacc']:+.1%}"; gtxt='—' if pd.isna(cre['gexmom']) else f"{cre['gexmom']:+.2f}"
+    diag=pd.DataFrame([['Magnet cluster share',f"{cre['share']:.0%}"],['IV short-vs-mid acceleration',ivtxt],['5D normalized GEX momentum',gtxt],['Latest EM utilization','—' if pd.isna(emr['utilization']) else f"{emr['utilization']:.2f}x"]],columns=['Input','Reading'])
+    st.dataframe(diag,use_container_width=True,hide_index=True)
+    st.info('Expansion direction is intentionally left to price/TA confirmation before choosing call vs put expression.')
+
+with T3:
     st.markdown('#### Expected Move Regime')
     st.caption('Weekly expected-move containment and utilization. Use this as volatility-regime context alongside GEX and the gamma flip—not as a breakout timer.')
     hit_txt=f"{emr['hit_rate']:.0%}" if pd.notna(emr['hit_rate']) else '—'
@@ -405,7 +466,7 @@ with T2:
         ew['Inside EM']=ew['Inside EM'].map(lambda v:'Yes' if v else 'No')
         st.dataframe(ew[['Week','Close Price','Expected Move','Realized Move','EM Utilization','Inside EM']],use_container_width=True,hide_index=True,height=455)
 
-with T3:
+with T4:
     days=st.segmented_control('Window',['20D','60D','All'],default='60D')
     hh=h.tail(20 if days=='20D' else 60 if days=='60D' else len(h))
     fig=go.Figure(); fig.add_trace(go.Scatter(x=hh.Date,y=hh['Close Price'],name='Close')); fig.add_trace(go.Scatter(x=hh.Date,y=hh['Max Pain 1d'],name='Max Pain',line=dict(dash='dot'))); fig.update_layout(height=350,title='Price vs Max Pain'); st.plotly_chart(fig,use_container_width=True)
@@ -414,7 +475,7 @@ with T3:
         fig=go.Figure(go.Bar(x=hh.Date,y=hh[y],name=y)); fig.add_hline(y=0); fig.update_layout(height=330,title=title); col.plotly_chart(fig,use_container_width=True)
     fig=go.Figure(); fig.add_trace(go.Scatter(x=hh.Date,y=hh['IV 30d'],name='IV30')); fig.add_trace(go.Scatter(x=hh.Date,y=hh['IV Rank'],name='IV Rank')); fig.update_layout(height=330,title='Volatility Regime'); st.plotly_chart(fig,use_container_width=True)
 
-with T4:
+with T5:
     pos=pd.merge(g,x,on='expiration_dt',how='outer',suffixes=('_gex','_dex')).sort_values('expiration_dt')
     pos['GEX Share']=pos.net_gex.abs()/max(pos.net_gex.abs().sum(),1); pos['DEX Share']=pos.net_dex.abs()/max(pos.net_dex.abs().sum(),1)
     analysis_date=pd.Timestamp(actual_date).normalize()
@@ -438,7 +499,7 @@ with T4:
     fig=go.Figure(go.Bar(x=filt.expiration_dt,y=filt.net_gex)); fig.add_hline(y=0); fig.update_layout(height=350,title='Net GEX by Expiration'); col1.plotly_chart(fig,use_container_width=True)
     fig=go.Figure(go.Bar(x=filt.expiration_dt,y=filt.net_dex)); fig.add_hline(y=0); fig.update_layout(height=350,title='Net DEX by Expiration'); col2.plotly_chart(fig,use_container_width=True)
 
-with T5:
+with T6:
     c1,c2,c3,c4=st.columns(4)
     maxd=int(max(f.DTE.max(skipna=True),u.DTE.max(skipna=True),1)); dte=c1.slider('Max DTE',0,min(maxd,900),60)
     typ=c2.multiselect('Type',['Call','Put'],default=['Call','Put']); minprem=c3.number_input('Min premium $',0.0,value=0.0,step=10000.0); minvoi=c4.number_input('Min unusual Vol/OI',0.0,value=2.0,step=.5)
@@ -454,7 +515,7 @@ with T5:
     b.markdown('**Unusual / new-positioning candidates**'); b.dataframe(uu.sort_values('Vol/OI',ascending=False).head(30),use_container_width=True,hide_index=True)
     st.caption('Mid-market and multi-leg prints are intentionally treated with lower directional confidence in the confluence model.')
 
-with T6:
+with T7:
     strikes=sorted(set(f.Strike.dropna()).union(set(u.Strike.dropna())))
     default=min(range(len(strikes)),key=lambda i:abs(strikes[i]-m['spot'])) if strikes else 0
     strike=st.selectbox('Strike',strikes,index=default if strikes else 0)
