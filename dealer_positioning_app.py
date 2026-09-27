@@ -90,6 +90,7 @@ def first_valid(*xs):
 
 def classify(df):
     c=set(df.columns)
+    if {'strike','call_gex','put_gex','net_gex'}.issubset(c): return 'gex_strike'
     if {'Date','Close Price','GEX Net OI','DEX Net OI'}.issubset(c): return 'history'
     if {'expiration','net_gex','call_gex','put_gex','gamma_flip'}.issubset(c): return 'gex'
     if {'expiration','net_dex','call_dex','put_dex'}.issubset(c): return 'dex'
@@ -205,7 +206,34 @@ def regime_metrics(h,g,x,em,f,u):
     return dict(spot=spot,gex=gex,dex=dex,dg=dg,dd=dd,iv=iv,ivr=ivr,regime=reg,stability=stability,pressure=pressure,
                 gamma_flip=gr.get('gamma_flip',np.nan),call_wall=gr.get('call_wall',np.nan),put_wall=gr.get('put_wall',np.nan),maxpain=last.get('Max Pain 1d',np.nan))
 
-def calendar_regime_engine(h,g,x,m,emr):
+def strike_gex_metrics(gxs, spot):
+    if gxs is None or gxs.empty or pd.isna(spot):
+        return dict(near_magnet=np.nan, raw_magnet=np.nan, zone_low=np.nan, zone_high=np.nan, near_gex=np.nan, available=False)
+    z=gxs.copy()
+    for c in ['strike','call_gex','put_gex','net_gex']:
+        z[c]=z[c].map(num)
+    z=z.dropna(subset=['strike','net_gex'])
+    pos=z[z['net_gex']>0].copy()
+    if pos.empty:
+        return dict(near_magnet=np.nan, raw_magnet=np.nan, zone_low=np.nan, zone_high=np.nan, near_gex=np.nan, available=True)
+    raw=pos.loc[pos['net_gex'].idxmax()]
+    # Near-spot magnet: positive GEX weighted by distance so a huge distant strike
+    # does not overwhelm the dealer structure immediately relevant to spot.
+    window=max(spot*.03,100)
+    near=pos[(pos['strike']-spot).abs()<=window].copy()
+    if near.empty: near=pos.copy()
+    decay=max(spot*.0075,25)
+    near['magnet_score']=near['net_gex']*np.exp(-(near['strike']-spot).abs()/decay)
+    nr=near.loc[near['magnet_score'].idxmax()]
+    # Positive-GEX zone = material nearby bars (>=20% of strongest nearby +GEX).
+    cutoff=max(near['net_gex'].max()*.20,0)
+    zone=near[near['net_gex']>=cutoff]
+    return dict(near_magnet=float(nr['strike']), raw_magnet=float(raw['strike']),
+                zone_low=float(zone['strike'].min()) if len(zone) else np.nan,
+                zone_high=float(zone['strike'].max()) if len(zone) else np.nan,
+                near_gex=float(nr['net_gex']), available=True)
+
+def calendar_regime_engine(h,g,x,m,emr,gxs=None):
     last=h.iloc[-1]; spot=m['spot']
     mp=[num(last.get(c)) for c in h.columns if c.startswith('Max Pain') and pd.notna(last.get(c))]
     gs=g.sort_values('expiration_dt').head(4); xs=x.sort_values('expiration_dt').head(4)
@@ -268,7 +296,8 @@ def calendar_regime_engine(h,g,x,m,emr):
     elif compression and two: reg,strat='COMPRESSION — DEFINED RANGE','Double calendar'
     elif compression: reg,strat='COMPRESSION — MIXED STRUCTURE','ATM calendar / wait for clearer walls'
     else: reg,strat='NEUTRAL / UNRESOLVED','Wait for confirmation'
-    return dict(regime=reg,strategy=strat,magnet=magnet,share=share,lower=lower,upper=upper,boundary=bscore,transition=min(100,ts),ivacc=iva,gexmom=gm,distinct_gap=distinct_gap,two_boundary=two)
+    sx=strike_gex_metrics(gxs,spot)
+    return dict(regime=reg,strategy=strat,magnet=magnet,share=share,lower=lower,upper=upper,boundary=bscore,transition=min(100,ts),ivacc=iva,gexmom=gm,distinct_gap=distinct_gap,two_boundary=two,**sx)
 
 def level_table(m,g,x,em,f,u):
     spot=m['spot']; rows=defaultdict(lambda:{'score':0,'evidence':[],'flow_premium':0,'unusual':0})
@@ -317,10 +346,10 @@ def level_table(m,g,x,em,f,u):
 
 # ---------- Sidebar / load ----------
 st.title('🎯 Dealer Positioning Command Center')
-st.caption('Regime → Positioning → Flow → Levels → Setup  •  Six-file dealer/flow model')
+st.caption('Regime → Positioning → Flow → Levels → Setup  •  Six required files + optional GEX-by-strike enhancement')
 with st.sidebar:
     st.header('Data')
-    uploads=st.file_uploader('Drop all 6 CSV files',type='csv',accept_multiple_files=True,help='Files are identified automatically from their columns.')
+    uploads=st.file_uploader('Drop 6 required CSVs + optional GEX-by-strike CSV',type='csv',accept_multiple_files=True,help='Files are identified automatically from their columns.')
     use_demo=st.toggle('Use bundled COIN files',value=not bool(uploads))
     st.link_button(
         "⚡ Convexity Screener",
@@ -357,11 +386,13 @@ with st.sidebar:
         "https://freedom-4rbsvk5mg32dybsiqwxwna.streamlit.app/",
         use_container_width=True
     )
-    st.divider(); st.caption('Required: historical option data, GEX by expiration, DEX by expiration, expected move, options flow, unusual activity.')
+    st.divider(); st.caption('Required: historical option data, GEX by expiration, DEX by expiration, expected move, options flow, unusual activity. Optional: GEX by strike for near-spot gamma magnet/zone detection.')
 
 data=demo_data() if use_demo else load_uploaded(uploads)[0]
-if len(data)<6:
-    st.warning(f'Recognized {len(data)}/6 datasets: {", ".join(data.keys()) or "none"}. Upload the remaining files.')
+required={'history','gex','dex','em','flow','unusual'}
+missing=required-set(data)
+if missing:
+    st.warning(f'Recognized required datasets: {', '.join(sorted(required & set(data))) or 'none'}. Missing: {', '.join(sorted(missing))}.')
     st.stop()
 
 h,g,x,em,f,u=prep(data)
@@ -388,7 +419,8 @@ if h_view.empty:
 actual_date=pd.to_datetime(h_view['Date'].max()).date()
 m=regime_metrics(h_view,g,x,em,f,u); levels=level_table(m,g,x,em,f,u)
 emr=expected_move_regime(h_view)
-cre=calendar_regime_engine(h_view,g,x,m,emr)
+gxs=data.get('gex_strike')
+cre=calendar_regime_engine(h_view,g,x,m,emr,gxs)
 
 with header_left:
     st.subheader(f'{ticker} • {actual_date}')
@@ -460,17 +492,21 @@ with T1:
 
 with T2:
     st.markdown('#### 🧭 Calendar Regime Engine')
-    st.caption('Classifies the six-file setup into the calendar regime playbook. Directional expansion still requires price/TA confirmation.')
+    st.caption('Classifies the dealer/volatility setup into the calendar regime playbook. When GEX-by-strike is uploaded, the engine separately identifies the structural magnet and the near-spot gamma magnet/positive-GEX zone.')
     regime_cards=f"""
     <div class="cre-grid">
       <div class="cre-card"><div class="cre-label">Current Regime</div><div class="cre-value">{cre['regime']}</div><div class="cre-sub">Calendar regime classification from EM, dealer clustering and transition inputs.</div></div>
       <div class="cre-card"><div class="cre-label">Preferred Structure</div><div class="cre-value">{cre['strategy']}</div><div class="cre-sub">Structure associated with the detected regime.</div></div>
-      <div class="cre-card"><div class="cre-label">Dealer Magnet</div><div class="cre-value price">{fmt_price(cre['magnet'])}</div><div class="cre-badge">↑ {cre['share']:.0%} cluster share</div></div>
+      <div class="cre-card"><div class="cre-label">Structural Magnet</div><div class="cre-value price">{fmt_price(cre['magnet'])}</div><div class="cre-badge">↑ {cre['share']:.0%} cluster share</div><div class="cre-sub">GEX/DEX walls, gamma flip and max-pain clustering.</div></div>
       <div class="cre-card"><div class="cre-label">Transition Risk</div><div class="cre-value price">{cre['transition']:.0f}/100</div><div class="cre-sub">Higher readings indicate increasing risk of leaving the current regime.</div></div>
       <div class="cre-card"><div class="cre-label">Lower Boundary</div><div class="cre-value price">{fmt_price(cre['lower'])}</div><div class="cre-sub">Lower dealer-positioning boundary detected by the engine.</div></div>
       <div class="cre-card"><div class="cre-label">Upper Boundary</div><div class="cre-value price">{fmt_price(cre['upper'])}</div><div class="cre-sub">Upper dealer-positioning boundary detected by the engine.</div></div>
       <div class="cre-card"><div class="cre-label">Boundary Credibility</div><div class="cre-value price">{cre['boundary']:.0f}/100</div><div class="cre-sub">Strength of evidence supporting the detected range boundaries.</div></div>
       <div class="cre-card"><div class="cre-label">EM Regime</div><div class="cre-value">{emr['label']}</div><div class="cre-sub">Current expected-move containment classification.</div></div>
+      <div class="cre-card"><div class="cre-label">Near-Spot GEX Magnet</div><div class="cre-value price">{fmt_price(cre['near_magnet'])}</div><div class="cre-sub">Distance-weighted positive GEX concentration near current spot.</div></div>
+      <div class="cre-card"><div class="cre-label">Positive-GEX Zone</div><div class="cre-value price">{fmt_price(cre['zone_low'])} – {fmt_price(cre['zone_high'])}</div><div class="cre-sub">Material nearby positive-GEX strikes from the optional strike-level file.</div></div>
+      <div class="cre-card"><div class="cre-label">Largest +GEX Strike</div><div class="cre-value price">{fmt_price(cre['raw_magnet'])}</div><div class="cre-sub">Largest positive net-GEX strike in the uploaded strike distribution.</div></div>
+      <div class="cre-card"><div class="cre-label">GEX-by-Strike</div><div class="cre-value">{'Loaded' if cre['available'] else 'Not loaded'}</div><div class="cre-sub">Optional enhancement; regime engine still works with the six required files.</div></div>
     </div>
     """
     st.markdown(regime_cards,unsafe_allow_html=True)
@@ -479,8 +515,23 @@ with T2:
     st.dataframe(play,use_container_width=True,hide_index=True)
     st.markdown('##### Diagnostics')
     ivtxt='—' if pd.isna(cre['ivacc']) else f"{cre['ivacc']:+.1%}"; gtxt='—' if pd.isna(cre['gexmom']) else f"{cre['gexmom']:+.2f}"
-    diag=pd.DataFrame([['Magnet cluster share',f"{cre['share']:.0%}"],['IV short-vs-mid acceleration',ivtxt],['5D normalized GEX momentum',gtxt],['Latest EM utilization','—' if pd.isna(emr['utilization']) else f"{emr['utilization']:.2f}x"]],columns=['Input','Reading'])
+    diag=pd.DataFrame([['Magnet cluster share',f"{cre['share']:.0%}"],['IV short-vs-mid acceleration',ivtxt],['5D normalized GEX momentum',gtxt],['Latest EM utilization','—' if pd.isna(emr['utilization']) else f"{emr['utilization']:.2f}x"],['Near-spot GEX magnet',fmt_price(cre['near_magnet'])],['Positive-GEX zone',f"{fmt_price(cre['zone_low'])} – {fmt_price(cre['zone_high'])}"]],columns=['Input','Reading'])
     st.dataframe(diag,use_container_width=True,hide_index=True)
+
+    if cre['available'] and gxs is not None:
+        gz=gxs.copy()
+        for cc in ['strike','net_gex']: gz[cc]=gz[cc].map(num)
+        gz=gz.dropna(subset=['strike','net_gex'])
+        w=max(m['spot']*.035,125)
+        gz=gz[(gz['strike']>=m['spot']-w)&(gz['strike']<=m['spot']+w)].sort_values('strike')
+        if len(gz):
+            fig=go.Figure(go.Bar(x=gz['strike'],y=gz['net_gex'],name='Net GEX'))
+            fig.add_hline(y=0)
+            fig.add_vline(x=m['spot'],line_dash='dash',annotation_text='Spot')
+            if pd.notna(cre['magnet']): fig.add_vline(x=cre['magnet'],line_dash='dot',annotation_text='Structural Magnet')
+            if pd.notna(cre['near_magnet']): fig.add_vline(x=cre['near_magnet'],line_dash='dot',annotation_text='Near-Spot GEX Magnet')
+            fig.update_layout(height=380,title='Strike-Level Net GEX Near Spot',xaxis_title='Strike',yaxis_title='Net GEX')
+            st.plotly_chart(fig,use_container_width=True)
     st.info('Expansion direction is intentionally left to price/TA confirmation before choosing call vs put expression.')
 
 with T3:
