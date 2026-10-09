@@ -39,6 +39,9 @@ st.markdown('''
 .emr-label{font-size:1rem;font-weight:750;line-height:1.3;margin-bottom:18px;white-space:normal}
 .emr-value{font-size:2.35rem;font-weight:760;line-height:1.08;letter-spacing:-.025em;margin-bottom:14px;white-space:normal;overflow-wrap:anywhere}
 .emr-value.emr-regime{font-size:1.75rem}
+.current-em-grid{grid-template-columns:repeat(auto-fit,minmax(min(100%,210px),1fr))}
+.current-em-grid .emr-card{min-height:160px}
+.current-em-grid .emr-value{white-space:normal;overflow:visible;text-overflow:clip;line-height:1.25}
 .emr-sub{font-size:.9rem;line-height:1.45;color:rgba(49,61,82,.78);white-space:normal}
 @media (max-width:1100px){.emr-grid{grid-template-columns:repeat(2,minmax(220px,1fr))}}
 @media (max-width:650px){.emr-grid{grid-template-columns:1fr}.emr-card{min-height:auto}}
@@ -592,11 +595,13 @@ with T3:
     if current:
         status='Completed' if current['Completed'] else 'In progress'
         st.markdown(f"**Latest week ({status}) — {current['Week']:%Y-%m-%d}**")
-        cols=st.columns(4)
-        cols[0].metric('Frozen lower / upper', f"{current['Lower EM']:,.1f} / {current['Upper EM']:,.1f}")
-        cols[1].metric('Daily closing breaches', current['Close Breaches'])
-        cols[2].metric('Consecutive closing breaches', current['Consecutive Close Breaches'])
-        cols[3].metric('Observed status', 'EM BREACH' if not current['Inside EM'] else 'Inside observed band')
+        observed_status='EM BREACH' if not current['Inside EM'] else 'Inside observed band'
+        st.markdown(f"""<div class="emr-grid current-em-grid">
+          <div class="emr-card"><div class="emr-label">Frozen lower / upper</div><div class="emr-value emr-regime">{current['Lower EM']:,.1f}<br/>{current['Upper EM']:,.1f}</div></div>
+          <div class="emr-card"><div class="emr-label">Daily closing breaches</div><div class="emr-value">{current['Close Breaches']}</div></div>
+          <div class="emr-card"><div class="emr-label">Consecutive closing breaches</div><div class="emr-value">{current['Consecutive Close Breaches']}</div></div>
+          <div class="emr-card"><div class="emr-label">Observed status</div><div class="emr-value emr-regime">{observed_status}</div></div>
+        </div>""", unsafe_allow_html=True)
         st.caption(f"Anchor: {current['Date']:%Y-%m-%d}. Coverage: {current['Basis']}. Last close: {current['Last Close']:,.2f}.")
         if current['Basis']=='Daily closes only':
             st.warning('No complete daily high/low data: intraday containment cannot be verified. Inside EM means daily closes only.')
