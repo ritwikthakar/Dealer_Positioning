@@ -138,42 +138,83 @@ def prep(d):
     return h,g,x,em,f,u
 
 def expected_move_regime(h):
-    """Estimate weekly expected-move containment from IV30 history.
+    """Freeze prior-week close/IV; test EVERY daily observation in next week.
 
-    Uses Friday/last-observation-of-week close as the weekly anchor and
-    EM ~= spot * (IV30/100) / sqrt(52).  This is a regime/context metric,
-    not the expiration-specific ATM-straddle expected move.
+    IV30-derived bands are estimates, not expiration-specific straddle bands.
+    Without complete daily High/Low data, containment is close-only.
+    A holiday-shortened week becomes completed when a later week is observed.
     """
-    z=h[['Date','Close Price','IV 30d']].dropna().copy()
+    empty = dict(streak=0, hit_rate=np.nan, utilization=np.nan,
+                 label='Insufficient history', weekly=pd.DataFrame(), current=None,
+                 basis='Daily closes only')
+    z=h.copy()
+    z['Date']=pd.to_datetime(z['Date'], errors='coerce')
+    for c in ['Close Price', 'IV 30d', 'High', 'Low']:
+        if c in z:
+            z[c]=pd.to_numeric(z[c], errors='coerce')
+    z=z.dropna(subset=['Date','Close Price']).sort_values('Date')
+    z=z.drop_duplicates('Date', keep='last')
     if z.empty:
-        return dict(streak=0, hit_rate=np.nan, utilization=np.nan, label='Insufficient history', weekly=pd.DataFrame())
-    z['Date']=pd.to_datetime(z['Date'])
-    z=z.sort_values('Date')
+        return empty
     z['week']=z['Date'].dt.to_period('W-FRI')
-    # Last available observation in each trading week.
-    w=z.groupby('week',as_index=False).tail(1).copy().sort_values('Date')
-    w['EM']=w['Close Price']*(w['IV 30d']/100.0)/np.sqrt(52)
-    w['Next Close']=w['Close Price'].shift(-1)
-    w['Realized Move']=(w['Next Close']-w['Close Price']).abs()
-    w['EM Utilization']=w['Realized Move']/w['EM'].replace(0,np.nan)
-    w['Inside EM']=w['EM Utilization']<=1
-    completed=w[w['Next Close'].notna()].copy()
+    groups=list(z.groupby('week', sort=True))
+    rows=[]
+    for i in range(1,len(groups)):
+        prev_week, prev=groups[i-1]
+        week, days=groups[i]
+        # Do not silently bridge missing weeks or substitute an older IV.
+        if week.ordinal-prev_week.ordinal != 1:
+            continue
+        anchor=prev.iloc[-1]
+        iv=anchor['IV 30d']
+        em=anchor['Close Price']*(iv/100)/np.sqrt(52)
+        if not np.isfinite(em) or em<=0:
+            continue
+        center=anchor['Close Price']; upper=center+em; lower=center-em
+        full_range=all(c in days and days[c].notna().all() for c in ['High','Low'])
+        high=days['High'].max() if full_range else days['Close Price'].max()
+        low=days['Low'].min() if full_range else days['Close Price'].min()
+        up=max(0,(high-center)/em); down=max(0,(center-low)/em)
+        sides=np.where(days['Close Price']>upper,1,np.where(days['Close Price']<lower,-1,0))
+        consecutive=0; last_side=0
+        for side in sides:
+            consecutive=consecutive+1 if side and side==last_side else (1 if side else 0)
+            last_side=side
+        complete=i<len(groups)-1 or days['Date'].iloc[-1].weekday()==4
+        rows.append({'Week':week.end_time.normalize(), 'Date':anchor['Date'],
+                     'Close Price':center, 'EM':em, 'Upper EM':upper, 'Lower EM':lower,
+                     'Last Close':days['Close Price'].iloc[-1], 'Observed High':high,
+                     'Observed Low':low, 'Upside Utilization':up, 'Downside Utilization':down,
+                     'EM Utilization':max(up,down),
+                     'Close-to-Close Utilization':abs(days['Close Price'].iloc[-1]-center)/em,
+                     'Close Breaches':int((sides!=0).sum()),
+                     'Consecutive Close Breaches':consecutive,
+                     'Intraday Breach':bool(high>upper or low<lower) if full_range else None,
+                     'Inside EM':max(up,down)<=1, 'Completed':complete,
+                     'Basis':'Daily high/low' if full_range else 'Daily closes only'})
+    if not rows:
+        return empty
+    w=pd.DataFrame(rows); completed=w[w['Completed']]
     streak=0
     for inside in completed['Inside EM'].iloc[::-1]:
-        if bool(inside): streak+=1
-        else: break
+        if not inside: break
+        streak+=1
     recent=completed.tail(8)
     hit_rate=recent['Inside EM'].mean() if len(recent) else np.nan
-    utilization=completed['EM Utilization'].iloc[-1] if len(completed) else np.nan
-    if len(completed)<3:
+    current=w.iloc[-1].to_dict()
+    util=current['EM Utilization']
+    if not current['Inside EM']:
+        label='Expansion'
+    elif len(completed)<3:
         label='Insufficient history'
     else:
         util3=completed['EM Utilization'].tail(3).mean()
-        if util3<0.50 and (pd.isna(hit_rate) or hit_rate>=0.75): label='Compression'
-        elif util3<=0.80 and (pd.isna(hit_rate) or hit_rate>=0.625): label='Contained'
-        elif util3<=1.00: label='Testing implied range'
+        if util3<.50 and hit_rate>=.75: label='Compression'
+        elif util3<=.80 and hit_rate>=.625: label='Contained'
+        elif util3<=1: label='Testing implied range'
         else: label='Expansion'
-    return dict(streak=streak, hit_rate=hit_rate, utilization=utilization, label=label, weekly=completed)
+    return dict(streak=streak, hit_rate=hit_rate, utilization=util, label=label,
+                weekly=w, current=current, basis=current['Basis'])
 
 def regime_metrics(h,g,x,em,f,u):
     last=h.iloc[-1]; prev=h.iloc[-2] if len(h)>1 else last
@@ -540,22 +581,33 @@ with T3:
     hit_txt=f"{emr['hit_rate']:.0%}" if pd.notna(emr['hit_rate']) else '—'
     util_txt=f"{emr['utilization']:.2f}x" if pd.notna(emr['utilization']) else '—'
     em_cards=f'''<div class="emr-grid">
-      <div class="emr-card"><div class="emr-label">Consecutive Weeks Inside EM</div><div class="emr-value">{emr['streak']}</div><div class="emr-sub">Completed weeks contained within the IV30-derived expected move.</div></div>
-      <div class="emr-card"><div class="emr-label">8-Week Containment</div><div class="emr-value">{hit_txt}</div><div class="emr-sub">Share of the latest eight completed weeks that remained inside expected move.</div></div>
-      <div class="emr-card"><div class="emr-label">Latest EM Utilization</div><div class="emr-value">{util_txt}</div><div class="emr-sub">Absolute weekly close-to-close move ÷ expected move.</div></div>
-      <div class="emr-card"><div class="emr-label">Expected Move Regime</div><div class="emr-value emr-regime">{emr['label']}</div><div class="emr-sub">Current classification from recent realized-move utilization.</div></div>
+      <div class="emr-card"><div class="emr-label">Consecutive Weeks Inside EM</div><div class="emr-value">{emr['streak']}</div><div class="emr-sub">Completed weeks inside frozen IV30 bands on the available observations.</div></div>
+      <div class="emr-card"><div class="emr-label">8-Week Containment</div><div class="emr-value">{hit_txt}</div><div class="emr-sub">Share of the latest eight completed weeks contained on the available observations.</div></div>
+      <div class="emr-card"><div class="emr-label">Latest EM Utilization</div><div class="emr-value">{util_txt}</div><div class="emr-sub">Maximum observed excursion from the frozen prior-week close ÷ expected move.</div></div>
+      <div class="emr-card"><div class="emr-label">Expected Move Regime</div><div class="emr-value emr-regime">{emr['label']}</div><div class="emr-sub">Latest observed week included; a breach overrides historical compression.</div></div>
     </div>'''
     st.markdown(em_cards,unsafe_allow_html=True)
-    st.caption('Weekly EM is estimated as spot × IV30 / √52. Streak length is context; combine it with GEX, gamma flip and realized-range behavior.')
+    st.caption('Bands freeze the prior trading week’s final close and IV30: close × IV30 / √52. These estimates can differ from broker/straddle expected moves. All status is as of the latest uploaded observation.')
+    current=emr.get('current')
+    if current:
+        status='Completed' if current['Completed'] else 'In progress'
+        st.markdown(f"**Latest week ({status}) — {current['Week']:%Y-%m-%d}**")
+        cols=st.columns(4)
+        cols[0].metric('Frozen lower / upper', f"{current['Lower EM']:,.1f} / {current['Upper EM']:,.1f}")
+        cols[1].metric('Daily closing breaches', current['Close Breaches'])
+        cols[2].metric('Consecutive closing breaches', current['Consecutive Close Breaches'])
+        cols[3].metric('Observed status', 'EM BREACH' if not current['Inside EM'] else 'Inside observed band')
+        st.caption(f"Anchor: {current['Date']:%Y-%m-%d}. Coverage: {current['Basis']}. Last close: {current['Last Close']:,.2f}.")
+        if current['Basis']=='Daily closes only':
+            st.warning('No complete daily high/low data: intraday containment cannot be verified. Inside EM means daily closes only.')
     if len(emr['weekly']):
         ew=emr['weekly'].tail(12).copy()
-        ew['Week']=ew['Date'].dt.date
-        ew['Close Price']=ew['Close Price'].map(lambda v:f'{v:,.2f}')
-        ew['Expected Move']=ew['EM'].map(lambda v:f'±{v:,.1f}')
-        ew['Realized Move']=ew['Realized Move'].map(lambda v:f'{v:,.1f}')
-        ew['EM Utilization']=ew['EM Utilization'].map(lambda v:f'{v:.2f}x')
-        ew['Inside EM']=ew['Inside EM'].map(lambda v:'Yes' if v else 'No')
-        st.dataframe(ew[['Week','Close Price','Expected Move','Realized Move','EM Utilization','Inside EM']],use_container_width=True,hide_index=True,height=455)
+        ew['Inside EM']=ew['Inside EM'].map({True:'Yes',False:'No'})
+        st.dataframe(ew[['Week','Date','Close Price','Lower EM','Upper EM','EM',
+                         'Observed High','Observed Low','EM Utilization',
+                         'Close-to-Close Utilization','Close Breaches',
+                         'Consecutive Close Breaches','Inside EM','Completed','Basis']],
+                     use_container_width=True,hide_index=True,height=455)
 
 with T4:
     days=st.segmented_control('Window',['20D','60D','All'],default='60D')
