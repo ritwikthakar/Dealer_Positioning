@@ -62,6 +62,112 @@ def read_csv(upload):
         d["Exp Date"] = pd.to_datetime(d["Exp Date"], errors="coerce")
     return d
 
+
+ACTIVITY_KEYS = ["Symbol", "Exp Date", "Type", "Strike"]
+
+def load_activity(upload, kind, asof, dte_range):
+    """Validate snapshots, exclude footer/expired rows, preserve raw trade evidence."""
+    if upload is None:
+        return pd.DataFrame(), "Not uploaded"
+    d = pd.read_csv(io.BytesIO(upload.getvalue()))
+    d.columns = d.columns.str.strip()
+    required = ACTIVITY_KEYS + (["Side", "Premium"] if kind == "Flow" else ["Volume", "Open Int"])
+    missing = [c for c in required if c not in d]
+    if missing:
+        return pd.DataFrame(), "Missing columns: " + ", ".join(missing)
+    for c in ["Strike", "DTE", "Premium", "Volume", "Open Int", "Vol/OI", "Delta", "Size"]:
+        if c in d:
+            d[c] = to_num(d[c])
+    d["Symbol"] = d["Symbol"].astype(str).str.strip().str.upper()
+    d["Type"] = d["Type"].astype(str).str.strip().str.title()
+    d["Exp Date"] = pd.to_datetime(d["Exp Date"], errors="coerce").dt.normalize()
+    before = len(d)
+    d = d.dropna(subset=["Exp Date", "Strike"])
+    d = d[d["Type"].isin(["Call", "Put"])].copy()
+    d["Days remaining"] = (d["Exp Date"] - pd.Timestamp(asof)).dt.days
+    d = d[d["Days remaining"].between(*dte_range)].copy()
+    # Remove identical export rows, but do not collapse distinct executions.
+    d = d.drop_duplicates()
+    if kind == "Flow":
+        side = d["Side"].astype(str).str.lower().str.strip()
+        buy = side.isin(["ask", "above", "above ask", "at ask"])
+        sell = side.isin(["bid", "below", "below bid", "at bid"])
+        call = d["Type"].eq("Call")
+        d["Flow inference"] = np.select(
+            [(buy & call) | (sell & ~call), (buy & ~call) | (sell & call)],
+            ["Bullish lean", "Bearish lean"], default="Unclassified")
+        d["Premium"] = d["Premium"].clip(lower=0)
+    else:
+        d["Vol/OI"] = d["Volume"].div(d["Open Int"].where(d["Open Int"] > 0))
+    return d, f"{len(d):,} eligible rows / {before:,} uploaded"
+
+def activity_context(contracts, flow, unusual):
+    """Left joins keep discovery independent of activity-export coverage."""
+    x = contracts.copy()
+    fg = flow.groupby("Symbol") if not flow.empty else None
+    ug = unusual.groupby("Symbol") if not unusual.empty else None
+    rows = []
+    for sym in x["Symbol"].unique():
+        f = fg.get_group(sym) if fg is not None and sym in fg.groups else pd.DataFrame()
+        u = ug.get_group(sym) if ug is not None and sym in ug.groups else pd.DataFrame()
+        bull = f.loc[f["Flow inference"].eq("Bullish lean"), "Premium"].sum() if not f.empty else 0.
+        bear = f.loc[f["Flow inference"].eq("Bearish lean"), "Premium"].sum() if not f.empty else 0.
+        total = f["Premium"].sum() if not f.empty else 0.
+        classified = bull + bear
+        coverage = classified / total if total > 0 else 0.
+        balance = (bull-bear)/classified if classified > 0 else 0.
+        lean = "No matching flow" if f.empty else "Mixed / ambiguous"
+        if coverage >= .3 and abs(balance) >= .25:
+            lean = "Bullish lean" if balance > 0 else "Bearish lean"
+        rows.append({"Symbol":sym, "Flow Lean":lean, "Flow Premium":total,
+            "Bullish Premium":bull, "Bearish Premium":bear,
+            "Unclassified Premium":total-classified, "Classified %":100*coverage,
+            "Flow Prints":len(f), "Unusual Contracts":len(u),
+            "Max Unusual Vol/OI":u["Vol/OI"].max() if not u.empty else np.nan,
+            "Activity Coverage":"Both" if not f.empty and not u.empty else "Flow only" if not f.empty else "Unusual only" if not u.empty else "No match"})
+    x = x.merge(pd.DataFrame(rows), on="Symbol", how="left") if rows else x
+    for source, label in [(flow,"Exact Flow Prints"),(unusual,"Exact Unusual Rows")]:
+        if source.empty:
+            x[label] = 0
+        else:
+            counts = source.groupby(ACTIVITY_KEYS).size().rename(label).reset_index()
+            x = x.merge(counts, on=ACTIVITY_KEYS, how="left")
+            x[label] = x[label].fillna(0).astype(int)
+    if x.empty:
+        return x
+    expected = np.where(x["Type"].eq("Call"), "Bullish lean", "Bearish lean")
+    directional = x["Suggested Expression"].isin(["DIRECTIONAL OTM CALENDAR", "LONG OPTION / BACKSPREAD"])
+    clear = x["Flow Lean"].isin(["Bullish lean", "Bearish lean"])
+    x["Flow Alignment"] = np.select([directional & clear & x["Flow Lean"].eq(expected),
+        directional & clear & ~x["Flow Lean"].eq(expected), ~directional],
+        ["Aligned", "Conflict", "Direction-neutral structure"], default="Unconfirmed")
+    # This is a review queue, not a return/probability forecast or a new edge score.
+    x["Review Priority"] = np.select([x["Flow Alignment"].eq("Conflict"),
+        x["Flow Alignment"].eq("Aligned") & x["Exact Unusual Rows"].gt(0),
+        x["Flow Alignment"].eq("Aligned"), x["Activity Coverage"].eq("Both")],
+        ["Review conflict", "Aligned + exact unusual", "Flow aligned", "Activity present"], default="Base setup only")
+    return x
+
+def show_activity(sym, flow, unusual, contract=None):
+    st.caption("Execution side suggests aggressor direction; it does not establish opening intent, ownership, or a standalone position. Unusual volume is activity, not direction. Exports are partial snapshots.")
+    for label, source in [("Flow executions", flow), ("Unusual contracts", unusual)]:
+        st.markdown("#### " + label)
+        if source.empty:
+            st.info("No eligible data uploaded.")
+            continue
+        g = source[source["Symbol"].eq(sym)].copy()
+        if contract is not None:
+            exact = pd.Series(True, index=g.index)
+            for key in ACTIVITY_KEYS:
+                exact &= g[key].eq(contract[key])
+            g["Exact contract match"] = exact
+            g = g.sort_values("Exact contract match", ascending=False)
+        if g.empty:
+            st.info("No matching rows in this export.")
+        else:
+            st.dataframe(g, hide_index=True, use_container_width=True)
+
+
 def abs_score(s, lo, hi, inverse=False, neutral=50):
     x = pd.to_numeric(s, errors="coerce")
     z = ((x-lo)/(hi-lo)*100).clip(0,100)
@@ -197,6 +303,7 @@ def underlying_summary(x):
             "Best Spread %": best["Spread %"],
             "Best OI": best["Open Int"],
             "Best Volume": best["Volume"],
+            **{c: best[c] for c in ["Review Priority", "Activity Coverage", "Flow Lean", "Flow Alignment", "Flow Premium", "Classified %", "Unusual Contracts", "Max Unusual Vol/OI", "Exact Flow Prints", "Exact Unusual Rows"]},
         })
     return pd.DataFrame(rows).sort_values("Convexity Score", ascending=False)
 
@@ -205,11 +312,18 @@ def fmt_contract(row):
     return f'{row["Symbol"]} {row["Type"]} {row["Strike"]} | {exp} | {int(row["DTE"]) if pd.notna(row["DTE"]) else "?"} DTE'
 
 st.markdown('<div class="hero">⚡ Cheap Convexity Lab</div>', unsafe_allow_html=True)
-st.caption("One Barchart Options Screener CSV → underlying discovery → contract efficiency → expression selection → individual option analysis")
+st.caption("Options screener → convexity discovery → optional flow and unusual validation → contract analysis")
 
 with st.sidebar:
     st.header("Input")
     upload = st.file_uploader("Barchart Options Screener CSV", type=["csv"])
+    flow_upload = st.file_uploader("Options Flow CSV (optional)", type=["csv"])
+    unusual_upload = st.file_uploader("Unusual Activity CSV (optional)", type=["csv"])
+    activity_date = st.date_input("Activity snapshot date", value=pd.Timestamp.now(tz="America/Toronto").date())
+    activity_dte = st.slider("Activity expiration window (calendar days)", 0, 730, (1,90))
+    st.caption("Set the snapshot date to the export's trading date. The window excludes expired prints and isolates relevant maturities.")
+    activity_filter = st.selectbox("Activity coverage", ["All setups", "Both", "Flow only", "Unusual only", "Any activity"])
+    alignment_filter = st.selectbox("Flow validation", ["All", "Aligned", "Conflict", "Unconfirmed", "Direction-neutral structure"])
     st.divider()
     st.header("Score weights")
     wcheap = st.slider("Volatility cheapness", 0, 60, 30, 5)
@@ -259,7 +373,19 @@ missing = [c for c in EXPECTED if c not in df.columns]
 if missing:
     st.warning("Missing expected columns: " + ", ".join(missing))
 
+df = df.dropna(subset=["Exp Date", "Strike"])
+df = df[df["Type"].isin(["Call", "Put"])].copy()
 x = enrich(df, (wcheap,waccel,weff,wtrade))
+try:
+    flow, flow_status = load_activity(flow_upload, "Flow", activity_date, activity_dte)
+    unusual, unusual_status = load_activity(unusual_upload, "Unusual", activity_date, activity_dte)
+except Exception as exc:
+    st.error(f"Unable to parse activity export: {exc}")
+    st.stop()
+x = activity_context(x, flow, unusual)
+with st.sidebar:
+    st.caption("Flow: " + flow_status)
+    st.caption("Unusual: " + unusual_status)
 
 filtered = x[
     (x["Open Int"].fillna(0) >= min_oi) &
@@ -269,6 +395,10 @@ filtered = x[
     (x["Contract Score"] >= min_score)
 ].copy()
 
+if activity_filter != "All setups":
+    filtered = filtered[filtered["Activity Coverage"].ne("No match") if activity_filter == "Any activity" else filtered["Activity Coverage"].eq(activity_filter)]
+if alignment_filter != "All":
+    filtered = filtered[filtered["Flow Alignment"].eq(alignment_filter)]
 u = underlying_summary(filtered) if not filtered.empty else pd.DataFrame()
 
 m1,m2,m3,m4,m5 = st.columns(5)
@@ -283,7 +413,8 @@ tabs = st.tabs([
     "🔎 Contract Explorer",
     "🧪 Individual Option Analysis",
     "📊 Regime Map",
-    "🧾 Data Audit"
+    "🧾 Data Audit",
+    "🌊 Flow & Unusual Validation"
 ])
 
 with tabs[0]:
@@ -335,6 +466,7 @@ with tabs[1]:
 
         cols = [
             "Symbol","Type","Strike","Exp Date","DTE","Contract Score","Suggested Expression",
+            "Review Priority","Flow Lean","Flow Alignment","Activity Coverage","Exact Flow Prints","Exact Unusual Rows",
             "Delta","Gamma","Theta","Vega","Gamma/Theta","Vega/Theta","Th/Ga","Th/Ve",
             "Strk Dist","Exp Move","IV","IV/HV","IV Rank","1D IV Chg","5D IV Chg",
             "Bid","Ask","Mid","Spread %","Open Int","Volume"
@@ -407,6 +539,10 @@ with tabs[2]:
         q6.metric("Premium traded", f'${r["Premium"]:,.0f}' if pd.notna(r["Premium"]) else "—")
 
         st.info(str(r["Expression Reason"]))
+        st.markdown("#### Activity validation")
+        st.write({c: r[c] for c in ["Review Priority", "Flow Lean", "Flow Alignment", "Exact Flow Prints", "Exact Unusual Rows"]})
+        with st.expander("Inspect ticker flow and exact-contract evidence"):
+            show_activity(sym2, flow, unusual, r)
         st.caption(
             "Expression is a structure classification, not a directional signal. "
             "Use your chart plus GEX/DEX model for bullish/bearish bias, trigger and destination."
@@ -455,3 +591,20 @@ with tabs[4]:
         "The app therefore uses Bid/Ask/Mid for contract price and keeps Premium as an informational activity field. "
         "Expected Move is displayed but not used in a dollar-gamma formula because its unit should be confirmed before mixing it with raw Gamma."
     )
+with tabs[5]:
+    st.subheader("Flow & unusual-activity validation")
+    st.caption("Convexity scores and suggested expressions stay unchanged. Activity is a separate validation layer; no match means no evidence in the uploaded sample.")
+    st.write("Flow: " + flow_status + " · Unusual: " + unusual_status)
+    symbols = sorted(x["Symbol"].dropna().unique())
+    if symbols:
+        activity_sym = st.selectbox("Inspect ticker", symbols, key="activity_symbol")
+        context = x[x["Symbol"].eq(activity_sym)].iloc[0]
+        a,b,c,d = st.columns(4)
+        a.metric("Flow lean", context["Flow Lean"])
+        b.metric("Sample premium", f'${context["Flow Premium"]:,.0f}')
+        c.metric("Classified premium", f'{context["Classified %"]:.0f}%')
+        d.metric("Unusual contracts", int(context["Unusual Contracts"]))
+        st.dataframe(x[x["Symbol"].eq(activity_sym)][ACTIVITY_KEYS + ["Contract Score", "Flow Alignment", "Review Priority", "Exact Flow Prints", "Exact Unusual Rows"]], hide_index=True, use_container_width=True)
+        show_activity(activity_sym, flow, unusual)
+    with st.expander("How to read the validation"):
+        st.markdown("- Ask-side calls / bid-side puts: bullish lean. Ask-side puts / bid-side calls: bearish lean. Mid prints remain unclassified.\n- A ticker lean requires at least 30% classified premium and a 25% imbalance within classified premium. These are adjustable research heuristics, not calibrated probabilities.\n- Exact matches use ticker, expiration, option type and strike. Ticker evidence may concern a different maturity or strike.\n- Vol/OI uses prior reported open interest; it does not prove new positions. Flow and unusual activity can describe the same trades, so their volumes and premiums are never added together.\n- Snapshot date and maturity filters apply to both activity files. Flow time contains no date; verify the file's trading date yourself.\n- Calendar suitability still requires both legs, term structure, earnings checks, and chart/GEX validation.")
