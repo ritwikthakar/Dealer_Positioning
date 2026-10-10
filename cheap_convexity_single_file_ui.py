@@ -16,9 +16,27 @@ st.markdown("""
 <style>
 .block-container {padding-top: 1.1rem; padding-bottom: 2.5rem;}
 div[data-testid="stMetric"] {
-    background: rgba(30,41,59,.30);
-    border: 1px solid rgba(148,163,184,.18);
-    padding: 13px; border-radius: 11px;
+    background: #f1f5f9;
+    color: #0f172a;
+    border: 1px solid #cbd5e1;
+    padding: 14px; border-radius: 11px;
+    min-height: 112px;
+}
+div[data-testid="stMetric"] * {color: #0f172a !important;}
+div[data-testid="stMetricLabel"], div[data-testid="stMetricValue"],
+div[data-testid="stMetricValue"] > div {
+    overflow: visible !important;
+    white-space: normal !important;
+    text-overflow: clip !important;
+    overflow-wrap: anywhere;
+}
+div[data-testid="stMetricValue"] {
+    font-size: clamp(1.05rem, 1.6vw, 1.55rem) !important;
+    line-height: 1.35;
+}
+div[data-testid="stMetricLabel"] p {
+    font-size: .85rem !important;
+    white-space: normal !important;
 }
 div[data-testid="stSidebar"] {border-right: 1px solid rgba(148,163,184,.16);}
 .hero {font-size: 2rem; font-weight: 800; margin-bottom: -.25rem;}
@@ -33,6 +51,32 @@ EXPECTED = [
 ]
 PCT_COLS = {"IV","Imp Vol","IV Rank","1D IV Chg","5D IV Chg","5D/1M IV%"}
 NUM_COLS = set(EXPECTED) - {"Symbol","Type","Exp Date"} - PCT_COLS
+
+def classify_uploads(uploads):
+    roles = {}
+    for item in uploads:
+        try:
+            header = pd.read_csv(io.BytesIO(item.getvalue()), nrows=0)
+            cols = {str(c).strip() for c in header.columns}
+        except Exception as exc:
+            st.error(f"Cannot read {item.name}: {exc}")
+            st.stop()
+        if {"Symbol", "Strike", "Exp Date", "Gamma", "Theta", "Vega", "IV/HV"}.issubset(cols):
+            role = "Screener"
+        elif {"Symbol", "Strike", "Exp Date", "Side", "Premium"}.issubset(cols):
+            role = "Flow"
+        elif {"Symbol", "Strike", "Exp Date", "Volume", "Open Int", "Vol/OI"}.issubset(cols):
+            role = "Unusual activity"
+        else:
+            st.error(f"Unrecognized file: {item.name}. Upload a Barchart screener, flow or unusual-activity CSV.")
+            st.stop()
+        if role in roles:
+            st.error(f"Two files were detected as {role}. Keep one CSV per role in this snapshot.")
+            st.stop()
+        roles[role] = item
+        st.success(f"{role}: {item.name}")
+    return roles.get("Screener"), roles.get("Flow"), roles.get("Unusual activity")
+
 
 def to_num(s):
     return pd.to_numeric(
@@ -316,9 +360,13 @@ st.caption("Options screener → convexity discovery → optional flow and unusu
 
 with st.sidebar:
     st.header("Input")
-    upload = st.file_uploader("Barchart Options Screener CSV", type=["csv"])
-    flow_upload = st.file_uploader("Options Flow CSV (optional)", type=["csv"])
-    unusual_upload = st.file_uploader("Unusual Activity CSV (optional)", type=["csv"])
+    uploads = st.file_uploader(
+        "Upload screener, flow and unusual CSVs together",
+        type=["csv"], accept_multiple_files=True,
+        help="Select all three files in one selection. File roles are detected from their column headers.",
+    )
+    upload, flow_upload, unusual_upload = classify_uploads(uploads)
+    st.caption("The screener is required; flow and unusual activity are optional.")
     activity_date = st.date_input("Activity snapshot date", value=pd.Timestamp.now(tz="America/Toronto").date())
     activity_dte = st.slider("Activity expiration window (calendar days)", 0, 730, (1,90))
     st.caption("Set the snapshot date to the export's trading date. The window excludes expired prints and isolates relevant maturities.")
