@@ -581,7 +581,8 @@ tabs = st.tabs([
     "🧪 Individual Option Analysis",
     "📊 Regime Map",
     "🧾 Data Audit",
-    "🌊 Flow & Unusual Validation"
+    "🌊 Flow & Unusual Validation",
+    "🚀 Long-Call Setup"
 ])
 
 with tabs[0]:
@@ -804,3 +805,95 @@ with tabs[6]:
         show_activity(activity_sym, flow, unusual, flow_uploaded=flow_uploaded, unusual_uploaded=unusual_uploaded)
     with st.expander("How to read the validation"):
         st.markdown("- Ask-side calls / bid-side puts: bullish lean. Ask-side puts / bid-side calls: bearish lean. Mid prints remain unclassified.\n- A ticker lean requires at least the minimum number of classified prints, 30% classified premium, a 25% imbalance within classified premium, and no single print above the share limit. Otherwise it is labelled Thin flow or Concentrated flow and treated as unconfirmed. These are adjustable research heuristics, not calibrated probabilities.\n- 'Flow not uploaded' and 'Not uploaded' mean the file was never provided; 'No matching flow' and 'No match' mean the file was provided but the ticker is absent from the sample.\n- Exact matches use ticker, expiration, option type and strike. Ticker evidence may concern a different maturity or strike.\n- Vol/OI uses prior reported open interest; it does not prove new positions. Flow and unusual activity can describe the same trades, so their volumes and premiums are never added together.\n- Snapshot date defaults to the date in the activity filenames, and maturity filters apply to both activity files. Flow time contains no date; verify the file's trading date yourself.\n- Calendar suitability still requires both legs, term structure, earnings checks, and chart/GEX validation.")
+
+with tabs[7]:
+    st.subheader("Long-call setup (preset filters)")
+    st.caption(
+        "Cheap-convexity filter set for buying calls: low IV rank, IV at or below realized vol, "
+        "directional delta, 30-60 DTE, tradeable fills. Filters are independent of the sidebar "
+        "contract filters. Adjust any of them. Check earnings dates yourself before entering."
+    )
+
+    r1 = st.columns(4)
+    lc_type = r1[0].selectbox("Type", ["Call", "Put", "Both"], key="lc_type")
+    lc_dte = r1[1].slider("DTE", 0, 365, (30, 60), key="lc_dte")
+    lc_delta = r1[2].slider("|Delta|", 0.05, 0.95, (0.30, 0.50), 0.01, key="lc_delta")
+    lc_rank = r1[3].slider("Max IV Rank %", 0, 100, 30, key="lc_rank")
+
+    r2 = st.columns(4)
+    lc_ivhv = r2[0].slider("Max IV/HV", 0.50, 1.50, 1.00, 0.05, key="lc_ivhv")
+    lc_oi = r2[1].number_input("Min open interest", 0, 1_000_000, 500, 100, key="lc_oi")
+    lc_vol = r2[2].number_input("Min volume", 0, 1_000_000, 50, 25, key="lc_vol")
+    lc_spread = r2[3].slider("Max bid/ask spread %", 1, 50, 15, key="lc_spread")
+
+    r3 = st.columns(3)
+    lc_no_conflict = r3[0].checkbox("Exclude flow conflicts", value=True, key="lc_noconf")
+    lc_best_only = r3[1].checkbox("Best contract per ticker", value=True, key="lc_best")
+    lc_be = r3[2].checkbox(
+        "Require Exp Move >= breakeven (confirm units first)", value=False, key="lc_be",
+        help="Compares the Exp Move column to the daily breakeven move. "
+             "Only meaningful if Exp Move is in the same $ units and horizon as the breakeven.",
+    )
+
+    lc = x.copy()
+    # Daily breakeven move in $: sqrt(2*|theta|/gamma). Assumes theta is per day, gamma per $1.
+    lc["Breakeven $/day"] = np.sqrt(2 * lc["Calc Th/Ga"])
+
+    m = pd.Series(True, index=lc.index)
+    if lc_type != "Both":
+        m &= lc["Type"].eq(lc_type)
+    m &= lc["DTE"].between(*lc_dte)
+    m &= lc["Delta"].abs().between(*lc_delta)
+    m &= lc["IV Rank"] <= lc_rank
+    m &= lc["IV/HV"] <= lc_ivhv
+    m &= lc["Open Int"] >= lc_oi
+    m &= lc["Volume"] >= lc_vol
+    m &= lc["Spread %"] <= lc_spread
+    if lc_no_conflict:
+        m &= lc["Flow Alignment"].ne("Conflict")
+    if lc_be:
+        m &= lc["Exp Move"] >= lc["Breakeven $/day"]
+
+    lc = lc[m].sort_values("Contract Score", ascending=False)
+    if lc_best_only:
+        lc = lc.drop_duplicates("Symbol")
+    lc = lc.reset_index(drop=True)
+    lc.insert(0, "Setup Rank", np.arange(1, len(lc) + 1))
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Contracts passing", f"{int(m.sum()):,}")
+    k2.metric("Tickers passing", f"{lc['Symbol'].nunique():,}")
+    k3.metric("Median IV/HV (passing)", f"{lc['IV/HV'].median():.2f}" if len(lc) else "—")
+
+    if lc.empty:
+        st.warning("No contracts pass these filters. Loosen IV Rank, IV/HV or the delta/DTE ranges.")
+    else:
+        cols = [
+            "Setup Rank", "Symbol", "Type", "Strike", "Exp Date", "DTE", "Contract Score",
+            "Delta", "Gamma", "Theta", "Vega", "Th/Ga", "Th/Ve", "Breakeven $/day", "Exp Move",
+            "IV", "IV/HV", "IV Rank", "1D IV Chg", "5D IV Chg",
+            "Bid", "Ask", "Spread %", "Open Int", "Volume",
+            "Flow Lean", "Flow Alignment", "Exact Unusual Rows",
+        ]
+        view = lc[[c for c in cols if c in lc.columns]].copy()
+        view["Exp Date"] = pd.to_datetime(view["Exp Date"]).dt.date
+        st.dataframe(
+            view, use_container_width=True, hide_index=True,
+            column_config={
+                "Contract Score": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f"),
+                "Breakeven $/day": st.column_config.NumberColumn(format="%.2f"),
+                "IV/HV": st.column_config.NumberColumn(format="%.2f"),
+                "IV Rank": st.column_config.NumberColumn(format="%.1f%%"),
+                "Spread %": st.column_config.NumberColumn(format="%.1f%%"),
+            },
+        )
+        st.download_button(
+            "Download long-call setup list",
+            view.to_csv(index=False).encode(),
+            "long_call_setup.csv", "text/csv",
+        )
+        st.caption(
+            "Ranked by Contract Score. Breakeven $/day = sqrt(2 x |Theta| / Gamma): the average daily "
+            "move the stock needs to beat decay. Th/Ga and Th/Ve are the Barchart ratios (lower = cheaper "
+            "per unit of gamma/vega). Direction still comes from your chart and GEX/DEX read."
+        )
