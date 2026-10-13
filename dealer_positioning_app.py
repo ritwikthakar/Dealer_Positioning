@@ -91,6 +91,85 @@ def first_valid(*xs):
         if pd.notna(x): return x
     return np.nan
 
+# ---------- Robustness helpers (price/vol-scaled; ignore expired + negligible expirations) ----------
+LEVEL_BAND=.35      # ignore dealer / max-pain levels further than 35% from spot (junk strikes)
+MIN_EXP_SHARE=.02   # an expiration needs >=2% of gross exposure to drive headline levels
+
+def weekly_unit(spot, iv30):
+    """One-week 1-sigma move in $. Every distance rule scales off this, so the same logic works for a
+    $100 stock and a $6,000 index (replaces hard-coded dollar floors that only suited high-priced tickers)."""
+    base=spot*(iv30/100)/np.sqrt(52) if pd.notna(iv30) and iv30>0 else spot*.02
+    return float(max(base, spot*.005))
+
+def live_expirations(g, x, asof, min_share=MIN_EXP_SHARE):
+    """Drop expirations on/before the analysis date (expired after the close) and expirations whose
+    exposure is negligible (e.g. a $89-GEX expiry with 190 walls). Falls back rather than returning empty."""
+    asof=pd.Timestamp(asof).normalize()
+    def keep(df, cols):
+        d=df[pd.to_datetime(df['expiration_dt']).dt.normalize()>asof].copy()
+        if d.empty: return df.sort_values('expiration_dt').copy()
+        gross=sum(d[c].abs().fillna(0) for c in cols)
+        k=d[gross/max(gross.sum(),1e-9)>=min_share]
+        return (k if len(k) else d).sort_values('expiration_dt')
+    return keep(g,['call_gex','put_gex']), keep(x,['call_dex','put_dex'])
+
+def profile_flip(gxs, spot):
+    """Zero-gamma price from the strike file's gex_profile (total net GEX at hypothetical spot prices).
+    Returns the zero crossing nearest spot (linear interpolation), or NaN if unavailable."""
+    if gxs is None or gxs.empty or 'gex_profile' not in gxs.columns or pd.isna(spot): return np.nan
+    p=gxs[['strike','gex_profile']].copy()
+    p['strike']=p['strike'].map(num); p['gex_profile']=p['gex_profile'].map(num)
+    p=p.dropna().sort_values('strike')
+    if len(p)<2: return np.nan
+    s=p['strike'].to_numpy(float); v=p['gex_profile'].to_numpy(float)
+    cross=[]
+    for i in range(len(s)-1):
+        if v[i]==0: cross.append(s[i])
+        elif v[i]*v[i+1]<0: cross.append(s[i]+(s[i+1]-s[i])*(-v[i])/(v[i+1]-v[i]))
+    if not cross: return np.nan
+    cross=np.array(cross); return float(cross[np.argmin(np.abs(cross-spot))])
+
+def aggregate_walls(gxs, spot):
+    """Largest call-GEX strike above spot and largest put-GEX strike below spot across ALL expirations."""
+    if gxs is None or gxs.empty or pd.isna(spot): return np.nan, np.nan
+    z=gxs.copy()
+    for c in ['strike','call_gex','put_gex']: z[c]=z[c].map(num)
+    z=z.dropna(subset=['strike'])
+    up=z[(z['strike']>spot)&(z['strike']<=spot*(1+LEVEL_BAND))].dropna(subset=['call_gex'])
+    dn=z[(z['strike']<spot)&(z['strike']>=spot*(1-LEVEL_BAND))].dropna(subset=['put_gex'])
+    cw=float(up.loc[up['call_gex'].idxmax(),'strike']) if len(up) and up['call_gex'].max()>0 else np.nan
+    pw=float(dn.loc[dn['put_gex'].idxmin(),'strike']) if len(dn) and dn['put_gex'].min()<0 else np.nan
+    return cw, pw
+
+def exposure_weighted_flip(gg):
+    """Fallback when no strike file: gross-gamma-weighted median of the per-expiration flips."""
+    fl=gg.dropna(subset=['gamma_flip'])
+    if fl.empty: return np.nan
+    w=(fl['call_gex'].abs()+fl['put_gex'].abs()).to_numpy(float); fv=fl['gamma_flip'].to_numpy(float)
+    o=np.argsort(fv); cum=np.cumsum(w[o])
+    return float(fv[o][min(np.searchsorted(cum,cum[-1]/2),len(fv)-1)])
+
+def flow_direction_bias(f):
+    """Type-aware aggressor lean in [-1,1]: ask calls / bid puts = bullish; ask puts / bid calls = bearish.
+    Mid prints are unclassified; multi-leg (ML*) prints are down-weighted, matching the level table."""
+    side=f['Side'].astype(str).str.lower(); typ=f['Type'].astype(str).str.title()
+    w=np.where(f['Code'].astype(str).str.upper().str.startswith('ML'),.45,1.0)
+    prem=f['Premium'].fillna(0).clip(lower=0)*w
+    bull=prem[((typ=='Call')&(side=='ask'))|((typ=='Put')&(side=='bid'))].sum()
+    bear=prem[((typ=='Put')&(side=='ask'))|((typ=='Call')&(side=='bid'))].sum()
+    return float((bull-bear)/max(bull+bear,1))
+
+def usable_em(em, asof, min_dte=3):
+    """Expected-move rows usable as levels/cards: drops 0-2 DTE rows (degenerate 300-500% IV artifacts)."""
+    e=em.dropna(subset=['date']).sort_values('date').copy()
+    dte=(e['date'].dt.normalize()-pd.Timestamp(asof).normalize()).dt.days
+    iv=pd.to_numeric(e['implied_volatility'],errors='coerce')
+    med=iv[dte>=min_dte].median()
+    ok=(dte>=min_dte)
+    if pd.notna(med): ok=ok&(iv<=3*med)
+    out=e[ok]
+    return out if len(out) else e
+
 def classify(df):
     c=set(df.columns)
     if {'strike','call_gex','put_gex','net_gex'}.issubset(c): return 'gex_strike'
@@ -219,7 +298,7 @@ def expected_move_regime(h):
     return dict(streak=streak, hit_rate=hit_rate, utilization=util, label=label,
                 weekly=w, current=current, basis=current['Basis'])
 
-def regime_metrics(h,g,x,em,f,u):
+def regime_metrics(h,g,x,em,f,u,gxs=None):
     last=h.iloc[-1]; prev=h.iloc[-2] if len(h)>1 else last
     spot=first_valid(last.get('Close Price'), f['Price~'].dropna().iloc[-1] if f['Price~'].notna().any() else np.nan)
     gex=last.get('GEX Net OI',np.nan); dex=last.get('DEX Net OI',np.nan)
@@ -231,26 +310,35 @@ def regime_metrics(h,g,x,em,f,u):
     else:
         reg='Negative Gamma — Deepening' if dg<0 else 'Negative Gamma — Recovering'
     if np.sign(gex)!=np.sign(prev.get('GEX Net OI',gex)): reg='Gamma Regime Transition'
-    # weighted nearest expiration levels
-    gg=g[g['expiration_dt']>=h['Date'].max()].sort_values('expiration_dt')
-    if gg.empty: gg=g.sort_values('expiration_dt')
+    # g/x are already filtered to live, material expirations (see live_expirations): no expired 0DTE chain.
+    gg=g.sort_values('expiration_dt')
     gr=gg.iloc[0]
+    # Aggregate gamma flip from the strike-level profile (zero crossing nearest spot); otherwise an
+    # exposure-weighted flip across live expirations. Walls likewise come from the all-expiration strike file.
+    flip=profile_flip(gxs,spot)
+    flip_src='Strike-level GEX profile'
+    if pd.isna(flip):
+        flip=exposure_weighted_flip(gg); flip_src='Exposure-weighted across expirations'
+    if pd.isna(flip): flip_src='Unavailable'
+    agg_cw,agg_pw=aggregate_walls(gxs,spot)
     # Scores are descriptive, not directional recommendations
     g_scale=max(h['GEX Net OI'].abs().quantile(.75),1)
     d_scale=max(h['DEX Net OI'].abs().quantile(.75),1)
     stability=50 + 25*np.tanh(gex/g_scale) + 10*np.tanh(dg/g_scale)
-    if pd.notna(gr.gamma_flip) and pd.notna(spot): stability += 10*np.tanh((spot-gr.gamma_flip)/(spot*.08))
+    if pd.notna(flip) and pd.notna(spot): stability += 10*np.tanh((spot-flip)/(spot*.08))
     stability=zclip(stability)
-    # directional pressure: positive means call/delta pressure; negative put pressure
-    ask=f[f['Side'].astype(str).str.lower().eq('ask')]['Premium'].sum()
-    bid=f[f['Side'].astype(str).str.lower().eq('bid')]['Premium'].sum()
-    flow_bias=(ask-bid)/max(ask+bid,1)
+    # directional pressure: positive means call/delta pressure; negative put pressure.
+    # Flow is type-aware (ask puts are bearish, bid puts bullish) and down-weights multi-leg prints.
+    flow_bias=flow_direction_bias(f)
     pressure=50 + 22*np.tanh(dex/d_scale) + 13*flow_bias
     pressure=zclip(pressure)
     return dict(spot=spot,gex=gex,dex=dex,dg=dg,dd=dd,iv=iv,ivr=ivr,regime=reg,stability=stability,pressure=pressure,
-                gamma_flip=gr.get('gamma_flip',np.nan),call_wall=gr.get('call_wall',np.nan),put_wall=gr.get('put_wall',np.nan),maxpain=last.get('Max Pain 1d',np.nan))
+                gamma_flip=flip,flip_src=flip_src,flow_bias=flow_bias,
+                call_wall=first_valid(agg_cw,gr.get('call_wall',np.nan)),put_wall=first_valid(agg_pw,gr.get('put_wall',np.nan)),
+                maxpain=last.get('Max Pain 1d',np.nan))
 
-def strike_gex_metrics(gxs, spot):
+def strike_gex_metrics(gxs, spot, unit=None):
+    unit=unit if unit else weekly_unit(spot,np.nan)
     if gxs is None or gxs.empty or pd.isna(spot):
         return dict(near_magnet=np.nan, raw_magnet=np.nan, zone_low=np.nan, zone_high=np.nan, near_gex=np.nan, available=False)
     z=gxs.copy()
@@ -263,10 +351,11 @@ def strike_gex_metrics(gxs, spot):
     raw=pos.loc[pos['net_gex'].idxmax()]
     # Near-spot magnet: positive GEX weighted by distance so a huge distant strike
     # does not overwhelm the dealer structure immediately relevant to spot.
-    window=max(spot*.03,100)
+    # Distances scale with the weekly 1-sigma move (price AND vol aware), not hard-coded dollar floors.
+    window=1.5*unit
     near=pos[(pos['strike']-spot).abs()<=window].copy()
     if near.empty: near=pos.copy()
-    decay=max(spot*.0075,25)
+    decay=.5*unit
     near['magnet_score']=near['net_gex']*np.exp(-(near['strike']-spot).abs()/decay)
     nr=near.loc[near['magnet_score'].idxmax()]
     # Positive-GEX zone = material nearby bars (>=20% of strongest nearby +GEX).
@@ -279,13 +368,15 @@ def strike_gex_metrics(gxs, spot):
 
 def calendar_regime_engine(h,g,x,m,emr,gxs=None):
     last=h.iloc[-1]; spot=m['spot']
+    unit=weekly_unit(spot,m['iv'])
+    near_spot=lambda v: pd.notna(v) and abs(float(v)/spot-1)<=LEVEL_BAND   # drop junk levels (e.g. 190 walls, 190 max pain)
     mp=[num(last.get(c)) for c in h.columns if c.startswith('Max Pain') and pd.notna(last.get(c))]
     gs=g.sort_values('expiration_dt').head(4); xs=x.sort_values('expiration_dt').head(4)
     lv=[]
     for _,r in gs.iterrows(): lv += [r.get('call_wall'),r.get('put_wall'),r.get('gamma_flip')]
     for _,r in xs.iterrows(): lv += [r.get('call_wall'),r.get('put_wall')]
-    lv=np.array([float(v) for v in lv+mp if pd.notna(v)])
-    tol=max(spot*.004,5); magnet=np.nan; share=0
+    lv=np.array([float(v) for v in lv+mp if near_spot(v)])
+    tol=max(.2*unit,spot*.004); magnet=np.nan; share=0
     if len(lv):
         cand=np.unique(np.round(lv*2)/2); counts=[np.sum(np.abs(lv-c)<=tol) for c in cand]; j=int(np.argmax(counts)); magnet=float(cand[j]); share=float(counts[j]/len(lv))
     # A defined range must have TWO boundaries that are genuinely distinct from
@@ -297,11 +388,11 @@ def calendar_regime_engine(h,g,x,m,emr,gxs=None):
         for _,r in df.iterrows():
             for c in ['call_wall','put_wall']:
                 v=r.get(c,np.nan)
-                if pd.notna(v): boundary_levels.append(float(v))
+                if near_spot(v): boundary_levels.append(float(v))
 
     # Require each boundary to sit outside the magnet cluster.  0.50% of spot is
     # deliberately a little stricter than the 0.40% magnet-clustering tolerance.
-    distinct_gap=max(spot*.005, tol*1.15, 10)
+    distinct_gap=max(spot*.005, tol*1.15)
     lows=[]; highs=[]
     for v in boundary_levels:
         anchor=magnet if pd.notna(magnet) else spot
@@ -324,7 +415,11 @@ def calendar_regime_engine(h,g,x,m,emr,gxs=None):
                           and (magnet-lower)>=distinct_gap
                           and (upper-magnet)>=distinct_gap)
     two=bool(distinct_from_magnet and pd.notna(width) and width>=.012 and bscore>=50)
-    vals=lambda names:[num(last.get(c)) for c in names if c in h.columns and pd.notna(last.get(c))]
+    # Short-dated IV buckets can be polluted by expiring/illiquid chains (IV 7d of 234% vs IV30 of 62%):
+    # keep only readings within 0.4x-2.5x of IV30 before computing term-structure acceleration.
+    iv_ref=m['iv']
+    ok_iv=lambda v: pd.notna(v) and (pd.isna(iv_ref) or .4*iv_ref<=v<=2.5*iv_ref)
+    vals=lambda names:[num(last.get(c)) for c in names if c in h.columns and ok_iv(num(last.get(c)))]
     short=vals(['IV 1d','IV 3d','IV 7d']); mid=vals(['IV 7d','IV 14d','IV 21d','IV 30d'])
     iva=(np.nanmean(short)/np.nanmean(mid)-1) if short and mid and np.nanmean(mid) else np.nan
     g5=m['gex']-h.iloc[-6].get('GEX Net OI',m['gex']) if len(h)>=6 else np.nan
@@ -340,8 +435,8 @@ def calendar_regime_engine(h,g,x,m,emr,gxs=None):
     elif compression and two: reg,strat='COMPRESSION — DEFINED RANGE','Double calendar'
     elif compression: reg,strat='COMPRESSION — MIXED STRUCTURE','ATM calendar / wait for clearer walls'
     else: reg,strat='NEUTRAL / UNRESOLVED','Wait for confirmation'
-    sx=strike_gex_metrics(gxs,spot)
-    return dict(regime=reg,strategy=strat,magnet=magnet,share=share,lower=lower,upper=upper,boundary=bscore,transition=min(100,ts),ivacc=iva,gexmom=gm,distinct_gap=distinct_gap,two_boundary=two,**sx)
+    sx=strike_gex_metrics(gxs,spot,unit)
+    return dict(regime=reg,strategy=strat,magnet=magnet,share=share,lower=lower,upper=upper,boundary=bscore,transition=min(100,ts),ivacc=iva,gexmom=gm,distinct_gap=distinct_gap,two_boundary=two,unit=unit,**sx)
 
 def level_table(m,g,x,em,f,u):
     spot=m['spot']; rows=defaultdict(lambda:{'score':0,'evidence':[],'flow_premium':0,'unusual':0})
@@ -352,8 +447,11 @@ def level_table(m,g,x,em,f,u):
     # nearest 4 expirations, diminishing weights
     gs=g.sort_values('expiration_dt').head(4)
     for i,r in gs.iterrows():
-        w=18 if len(rows)==0 else 12
-        add(r.call_wall,14,'GEX Call Wall'); add(r.put_wall,14,'GEX Put Wall'); add(r.gamma_flip,18,'Gamma Flip')
+        add(r.call_wall,14,'GEX Call Wall'); add(r.put_wall,14,'GEX Put Wall')
+    # One aggregate gamma flip (strike-level profile) instead of a different flip per expiration. It is the level
+    # where dealer hedging changes sign, so it is weighted above a single wall; flow/unusual activity usually
+    # sits on whole strikes, so without this the flip would sink below the strike-level rows.
+    add(m['gamma_flip'],40,'Gamma Flip')
     for _,r in x.sort_values('expiration_dt').head(4).iterrows():
         add(r.call_wall,10,'DEX Call Wall'); add(r.put_wall,10,'DEX Put Wall')
     add(m['maxpain'],10,'Max Pain')
@@ -461,16 +559,33 @@ h_view=h[pd.to_datetime(h['Date']).dt.date<=selected_date].copy()
 if h_view.empty:
     h_view=h.iloc[[0]].copy()
 actual_date=pd.to_datetime(h_view['Date'].max()).date()
-m=regime_metrics(h_view,g,x,em,f,u); levels=level_table(m,g,x,em,f,u)
-emr=expected_move_regime(h_view)
 gxs=data.get('gex_strike')
-cre=calendar_regime_engine(h_view,g,x,m,emr,gxs)
+# Live, material expirations only (no expired 0DTE chain, no negligible-exposure expiries) and usable EM rows.
+g_live,x_live=live_expirations(g,x,actual_date)
+em_live=usable_em(em,actual_date)
+m=regime_metrics(h_view,g_live,x_live,em_live,f,u,gxs); levels=level_table(m,g_live,x_live,em_live,f,u)
+emr=expected_move_regime(h_view)
+cre=calendar_regime_engine(h_view,g_live,x_live,m,emr,gxs)
 
 with header_left:
     st.subheader(f'{ticker} • {actual_date}')
 if actual_date != selected_date:
     st.caption(f'Using latest available market observation on {actual_date} for selected date {selected_date}.')
-firstem=em.sort_values('date').iloc[0]
+# Expected-move card: let the user pick a real, live expiration. Default = first expiration >=3 DTE, which
+# skips the 0-2 DTE rows whose implied vol is a degenerate artifact (e.g. 535%).
+em_by_date=em.assign(_d=em['date'].dt.date).drop_duplicates('_d').set_index('_d')
+_dte=lambda d:(pd.Timestamp(d)-pd.Timestamp(actual_date)).days
+em_dates=[d for d in g_live['expiration_dt'].dt.date.dropna().unique() if d in em_by_date.index and _dte(d)>=1]
+if em_dates:
+    with header_right:
+        em_pick=st.selectbox('Expected move to', em_dates,
+                             index=next((i for i,d in enumerate(em_dates) if _dte(d)>=3),0),
+                             format_func=lambda d:f'{d:%b %d} ({_dte(d)} DTE)', key='em_target',
+                             help='Expiration used for the Next Expected Move card.')
+    firstem=em_by_date.loc[em_pick]
+    em_tag=f'{em_pick:%b %d} · {_dte(em_pick)} DTE'
+else:
+    firstem=em_live.iloc[0]; em_tag=f'{firstem.date:%b %d}'
 prev_close=h_view.iloc[-2]['Close Price'] if len(h_view)>1 else np.nan
 close_chg=m['spot']-prev_close if pd.notna(prev_close) else np.nan
 close_pct=(close_chg/prev_close) if pd.notna(prev_close) and prev_close else np.nan
@@ -485,8 +600,8 @@ d5=(m['dex']-h_view.iloc[-6]['DEX Net OI']) if len(h_view)>=6 else np.nan
 reg_parts=m['regime'].split(' — ',1)
 reg_main=reg_parts[0]; reg_detail=reg_parts[1] if len(reg_parts)>1 else 'Transition'
 em_amt=firstem.get('expected_move_amt',np.nan)
-em_pct=firstem.get('expected_move_percentage',np.nan)
-if pd.notna(em_pct) and abs(em_pct)<1: em_pct*=100
+# Percent = amount / spot. (The old "if <1 then x100" heuristic turned a 0.91% move into 91%.)
+em_pct=em_amt/m['spot']*100 if pd.notna(em_amt) and m['spot'] else firstem.get('expected_move_percentage',np.nan)
 
 def _line(label,val):
     return f'{label}: {val}' if val not in (None,'') else ''
@@ -497,8 +612,8 @@ cards=f'''
   <div class="dp-card gex"><div class="dp-label"><span class="dp-icon">↗</span>Net GEX</div><div class="dp-value">{fmt_money(m['gex'])}</div><div class="dp-delta">{'↑' if m['dg']>=0 else '↓'} {fmt_money(m['dg'])} (1D)</div><div class="dp-sub">Prev: {fmt_money(prev_gex)}<br>{'5D Change: '+fmt_money(g5) if pd.notna(g5) else ''}</div></div>
   <div class="dp-card dex"><div class="dp-label"><span class="dp-icon">▤</span>Net DEX</div><div class="dp-value">{fmt_money(m['dex'])}</div><div class="dp-delta">{'↑' if m['dd']>=0 else '↓'} {fmt_money(m['dd'])} (1D)</div><div class="dp-sub">Prev: {fmt_money(prev_dex)}<br>{'5D Change: '+fmt_money(d5) if pd.notna(d5) else ''}</div></div>
   <div class="dp-card iv"><div class="dp-label"><span class="dp-icon">%</span>IV30 / IV Rank</div><div class="dp-value">{m['iv']:.2f}%</div><div class="dp-delta">IV Rank: {m['ivr']:.2f}%</div><div class="dp-sub">Current 30-day implied volatility and its historical rank.</div></div>
-  <div class="dp-card flip"><div class="dp-label"><span class="dp-icon">⊕</span>Gamma Flip</div><div class="dp-value">{fmt_price(m['gamma_flip'])}</div><div class="dp-delta">Spot: {fmt_price(m['spot'])}</div><div class="dp-sub">Distance: {((m['spot']/m['gamma_flip'])-1):+.1%} ({m['spot']-m['gamma_flip']:+.2f})</div></div>
-  <div class="dp-card em"><div class="dp-label"><span class="dp-icon">▣</span>Next Expected Move</div><div class="dp-value">{fmt_price(firstem.lower_price)} –<br>{fmt_price(firstem.upper_price)}</div><div class="dp-delta">{firstem.date.date()}</div><div class="dp-sub">Range: ± {fmt_price(em_amt).replace('$','')}<br>{f'({em_pct:.2f}%)' if pd.notna(em_pct) else ''}</div></div>
+  <div class="dp-card flip"><div class="dp-label"><span class="dp-icon">⊕</span>Gamma Flip</div><div class="dp-value">{fmt_price(m['gamma_flip'])}</div><div class="dp-delta">Spot: {fmt_price(m['spot'])}</div><div class="dp-sub">Distance: {((m['spot']/m['gamma_flip'])-1):+.1%} ({m['spot']-m['gamma_flip']:+.2f})<br>{m['flip_src']}</div></div>
+  <div class="dp-card em"><div class="dp-label"><span class="dp-icon">▣</span>Expected Move</div><div class="dp-value">{fmt_price(firstem.lower_price)} –<br>{fmt_price(firstem.upper_price)}</div><div class="dp-delta">{em_tag}</div><div class="dp-sub">Range: ± {fmt_price(em_amt).replace('$','')}<br>{f'({em_pct:.2f}%)' if pd.notna(em_pct) else ''}</div></div>
 </div>'''
 st.markdown(cards,unsafe_allow_html=True)
 
@@ -525,7 +640,7 @@ with T1:
     st.dataframe(show,use_container_width=True,hide_index=True,column_config={'Confluence':st.column_config.ProgressColumn('Confluence',min_value=0,max_value=100),'Zone':st.column_config.TextColumn('Zone',help='Below spot = Support; above spot = Resistance; at spot = Pivot.')})
     st.caption('Zone is relative to current spot: levels below spot are potential support; levels above spot are potential resistance. Price/TA confirmation is still required.')
 
-    fig=go.Figure(); ee=em.sort_values('date').head(20)
+    fig=go.Figure(); ee=em_live.sort_values('date').head(20)
     fig.add_trace(go.Scatter(x=ee.date,y=ee.upper_price,name='EM Upper',mode='lines'))
     fig.add_trace(go.Scatter(x=ee.date,y=ee.lower_price,name='EM Lower',mode='lines',fill='tonexty'))
     fig.add_hline(y=m['spot'],annotation_text=f'Spot {m["spot"]:.2f}')
@@ -566,7 +681,7 @@ with T2:
         gz=gxs.copy()
         for cc in ['strike','net_gex']: gz[cc]=gz[cc].map(num)
         gz=gz.dropna(subset=['strike','net_gex'])
-        w=max(m['spot']*.035,125)
+        w=max(2.5*cre['unit'],m['spot']*.05)
         gz=gz[(gz['strike']>=m['spot']-w)&(gz['strike']<=m['spot']+w)].sort_values('strike')
         if len(gz):
             fig=go.Figure(go.Bar(x=gz['strike'],y=gz['net_gex'],name='Net GEX'))
