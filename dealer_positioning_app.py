@@ -220,84 +220,102 @@ def prep(d):
     f['Exp Date']=pd.to_datetime(f['Exp Date'],errors='coerce'); u['Exp Date']=pd.to_datetime(u['Exp Date'],errors='coerce')
     return h,g,x,em,f,u
 
-def expected_move_regime(h):
-    """Freeze prior-week close/IV; test EVERY daily observation in next week.
+def expected_move_regime(h, verified_final_date=None, intraday=None):
+    """Frozen prior-week IV30 bands; keep close and intraday evidence separate.
 
-    IV30-derived bands are estimates, not expiration-specific straddle bands.
-    Without complete daily High/Low data, containment is close-only.
-    A holiday-shortened week becomes completed when a later week is observed.
+    A Friday row is NOT proof of a final settlement. A week completes only if a
+    later week is observed, or the user explicitly verifies its last observation.
+    intraday: optional {date, high, low, last} live snapshot; never a daily close.
     """
     empty = dict(streak=0, hit_rate=np.nan, utilization=np.nan,
                  label='Insufficient history', weekly=pd.DataFrame(), current=None,
-                 basis='Daily closes only')
+                 basis='Daily closes only', intraday_status='Unknown',
+                 closing_status='Unknown', reentry_status='Unknown')
     z=h.copy()
-    z['Date']=pd.to_datetime(z['Date'], errors='coerce')
-    for c in ['Close Price', 'IV 30d', 'High', 'Low']:
-        if c in z:
-            z[c]=pd.to_numeric(z[c], errors='coerce')
-    z=z.dropna(subset=['Date','Close Price']).sort_values('Date')
-    z=z.drop_duplicates('Date', keep='last')
-    if z.empty:
-        return empty
+    z['Date']=pd.to_datetime(z['Date'],errors='coerce')
+    for c in ['Close Price','IV 30d','High','Low']:
+        if c in z: z[c]=pd.to_numeric(z[c],errors='coerce')
+    z=z.dropna(subset=['Date','Close Price']).sort_values('Date').drop_duplicates('Date',keep='last')
+    if z.empty: return empty
     z['week']=z['Date'].dt.to_period('W-FRI')
-    groups=list(z.groupby('week', sort=True))
-    rows=[]
+    groups=list(z.groupby('week',sort=True)); rows=[]
     for i in range(1,len(groups)):
-        prev_week, prev=groups[i-1]
-        week, days=groups[i]
-        # Do not silently bridge missing weeks or substitute an older IV.
-        if week.ordinal-prev_week.ordinal != 1:
-            continue
-        anchor=prev.iloc[-1]
-        iv=anchor['IV 30d']
-        em=anchor['Close Price']*(iv/100)/np.sqrt(52)
-        if not np.isfinite(em) or em<=0:
-            continue
-        center=anchor['Close Price']; upper=center+em; lower=center-em
-        full_range=all(c in days and days[c].notna().all() for c in ['High','Low'])
-        high=days['High'].max() if full_range else days['Close Price'].max()
-        low=days['Low'].min() if full_range else days['Close Price'].min()
-        up=max(0,(high-center)/em); down=max(0,(center-low)/em)
-        sides=np.where(days['Close Price']>upper,1,np.where(days['Close Price']<lower,-1,0))
-        consecutive=0; last_side=0
-        for side in sides:
+        prev_week,prev=groups[i-1]; week,days=groups[i]
+        if week.ordinal-prev_week.ordinal!=1:continue
+        anchor=prev.iloc[-1]; iv=anchor['IV 30d']; center=anchor['Close Price']
+        em=center*(iv/100)/np.sqrt(52)
+        if not np.isfinite(em) or em<=0:continue
+        upper=center+em;lower=center-em
+        # All recorded daily closes are observations; latest Friday may be intraday.
+        close_sides=np.where(days['Close Price']>upper,1,np.where(days['Close Price']<lower,-1,0))
+        verified_date=pd.Timestamp(verified_final_date).date() if verified_final_date is not None else None
+        is_final=i<len(groups)-1 or (verified_date is not None and days['Date'].iloc[-1].date()==verified_date)
+        # For the current unfinished week, do not claim its last observation was a close.
+        close_valid=close_sides if is_final else close_sides[:-1]
+        consecutive=0;last_side=0
+        for side in close_valid:
             consecutive=consecutive+1 if side and side==last_side else (1 if side else 0)
             last_side=side
-        complete=i<len(groups)-1 or days['Date'].iloc[-1].weekday()==4
-        rows.append({'Week':week.end_time.normalize(), 'Date':anchor['Date'],
-                     'Close Price':center, 'EM':em, 'Upper EM':upper, 'Lower EM':lower,
-                     'Last Close':days['Close Price'].iloc[-1], 'Observed High':high,
-                     'Observed Low':low, 'Upside Utilization':up, 'Downside Utilization':down,
-                     'EM Utilization':max(up,down),
-                     'Close-to-Close Utilization':abs(days['Close Price'].iloc[-1]-center)/em,
-                     'Close Breaches':int((sides!=0).sum()),
+        has_hilo=('High' in days and 'Low' in days and days['High'].notna().all() and days['Low'].notna().all())
+        high=float(days['High'].max()) if has_hilo else np.nan
+        low=float(days['Low'].min()) if has_hilo else np.nan
+        latest_snapshot=False; snap_last=np.nan
+        if intraday and pd.Timestamp(intraday['date']).to_period('W-FRI')==week:
+            latest_snapshot=True
+            for field in ['high','low']:
+                val=intraday.get(field,np.nan)
+                if pd.notna(val):
+                    if field=='high':high=max(high,val) if pd.notna(high) else float(val)
+                    else:low=min(low,val) if pd.notna(low) else float(val)
+            snap_last=intraday.get('last',np.nan)
+        has_range=pd.notna(high) and pd.notna(low)
+        # When only daily closes exist, show utilization as close-only, not verified range.
+        observed_high=high if pd.notna(high) else float(days['Close Price'].max())
+        observed_low=low if pd.notna(low) else float(days['Close Price'].min())
+        up=max(0,(observed_high-center)/em);down=max(0,(center-observed_low)/em)
+        breach=bool(high>upper or low<lower) if has_range else None
+        closing_breach=bool(np.any(close_valid!=0)) if len(close_valid) else False
+        reentry='Unknown'
+        if latest_snapshot and pd.notna(snap_last) and breach is True:
+            reentry='Yes' if lower<=snap_last<=upper else 'No'
+        elif has_hilo and breach is True and is_final:
+            reentry='Yes (close)' if lower<=days['Close Price'].iloc[-1]<=upper else 'No (close)'
+        # Completed containment requires a genuine intraday range; otherwise close-only status.
+        inside=bool((not breach) if breach is not None else not closing_breach)
+        rows.append({'Week':week.end_time.normalize(),'Date':anchor['Date'],
+                     'Close Price':center,'EM':em,'Upper EM':upper,'Lower EM':lower,
+                     'Last Close':days['Close Price'].iloc[-1] if is_final else np.nan,
+                     'Observed High':observed_high,'Observed Low':observed_low,
+                     'EM Utilization':max(up,down), 'Close-to-Close Utilization':abs(days['Close Price'].iloc[-1]-center)/em,
+                     'Close Breaches':int(np.sum(close_valid!=0)),
                      'Consecutive Close Breaches':consecutive,
-                     'Intraday Breach':bool(high>upper or low<lower) if full_range else None,
-                     'Inside EM':max(up,down)<=1, 'Completed':complete,
-                     'Basis':'Daily high/low' if full_range else 'Daily closes only'})
-    if not rows:
-        return empty
-    w=pd.DataFrame(rows); completed=w[w['Completed']]
-    streak=0
+                     'Intraday Breach':breach,'Closing Breach':closing_breach,
+                     'Re-entry Inside EM':reentry,'Inside EM':inside,'Completed':is_final,
+                     'Basis':'Daily high/low' if has_hilo else ('Manual intraday snapshot + closes' if latest_snapshot else 'Daily closes only')})
+    if not rows:return empty
+    w=pd.DataFrame(rows);completed=w[w.Completed];streak=0
     for inside in completed['Inside EM'].iloc[::-1]:
-        if not inside: break
+        if not inside:break
         streak+=1
-    recent=completed.tail(8)
-    hit_rate=recent['Inside EM'].mean() if len(recent) else np.nan
-    current=w.iloc[-1].to_dict()
-    util=current['EM Utilization']
-    if not current['Inside EM']:
-        label='Expansion'
-    elif len(completed)<3:
-        label='Insufficient history'
+    recent=completed.tail(8);hit_rate=recent['Inside EM'].mean() if len(recent) else np.nan
+    current=w.iloc[-1].to_dict();util=current['EM Utilization']
+    if current['Intraday Breach'] is True:
+        label='Expansion warning — intraday EM breach'
+    elif current['Closing Breach']:
+        label='Expansion — closing EM breach'
+    elif len(completed)<3:label='Insufficient history'
     else:
         util3=completed['EM Utilization'].tail(3).mean()
-        if util3<.50 and hit_rate>=.75: label='Compression'
-        elif util3<=.80 and hit_rate>=.625: label='Contained'
-        elif util3<=1: label='Testing implied range'
-        else: label='Expansion'
-    return dict(streak=streak, hit_rate=hit_rate, utilization=util, label=label,
-                weekly=w, current=current, basis=current['Basis'])
+        if util3<.50 and hit_rate>=.75:label='Compression'
+        elif util3<=.80 and hit_rate>=.625:label='Contained'
+        elif util3<=1:label='Testing implied range'
+        else:label='Expansion'
+    intraday_status=('BREACH' if current['Intraday Breach'] else 'Inside observed range') if current['Intraday Breach'] is not None else 'Unknown — no high/low'
+    closing_status='BREACH' if current['Closing Breach'] else ('No confirmed breach' if current['Completed'] else 'Pending verified close')
+    return dict(streak=streak,hit_rate=hit_rate,utilization=util,label=label,
+                weekly=w,current=current,basis=current['Basis'],
+                intraday_status=intraday_status,closing_status=closing_status,
+                reentry_status=current['Re-entry Inside EM'])
 
 def regime_metrics(h,g,x,em,f,u,gxs=None):
     last=h.iloc[-1]; prev=h.iloc[-2] if len(h)>1 else last
@@ -429,7 +447,7 @@ def calendar_regime_engine(h,g,x,m,emr,gxs=None):
     ts += 25 if pd.notna(util) and util>=.8 else (12 if pd.notna(util) and util>=.6 else 0)
     ts += 20 if pd.notna(iva) and iva>.08 else (10 if pd.notna(iva) and iva>0 else 0)
     ts += 20 if pd.notna(gm) and gm<-.35 else (10 if pd.notna(gm) and gm<0 else 0); ts += 20 if m['gex']<0 else 0
-    compression=emr.get('label') in ['Compression','Contained']; expansion=emr.get('label')=='Expansion' or (pd.notna(util) and util>1)
+    compression=emr.get('label') in ['Compression','Contained']; expansion=str(emr.get('label','')).startswith('Expansion') or (pd.notna(util) and util>1)
     if expansion: reg,strat='EXPANSION','OTM directional calendar / diagonal'
     elif ts>=50 or emr.get('label')=='Testing implied range': reg,strat='TRANSITION','Reduce / stop new calendars'
     elif compression and share>=.45 and not two: reg,strat='COMPRESSION — SINGLE MAGNET','ATM calendar'
@@ -565,7 +583,19 @@ gxs=data.get('gex_strike')
 g_live,x_live=live_expirations(g,x,actual_date)
 em_live=usable_em(em,actual_date)
 m=regime_metrics(h_view,g_live,x_live,em_live,f,u,gxs); levels=level_table(m,g_live,x_live,em_live,f,u)
-emr=expected_move_regime(h_view)
+# Optional verified intraday data. Never silently equate a last quote to a close.
+with st.sidebar.expander('Weekly EM: intraday / verified close',expanded=False):
+    st.caption('Optional current-session SPX observations. High/low are needed to confirm an intraday breach. A last quote is not a verified close.')
+    use_intraday=st.checkbox('Supply intraday observations',value=False,key='em_manual_enable')
+    manual_high=st.number_input('Session high',min_value=0.,value=0.,step=1.,key='em_manual_high',disabled=not use_intraday)
+    manual_low=st.number_input('Session low',min_value=0.,value=0.,step=1.,key='em_manual_low',disabled=not use_intraday)
+    manual_last=st.number_input('Latest traded SPX',min_value=0.,value=0.,step=1.,key='em_manual_last',disabled=not use_intraday)
+    verify_close=st.checkbox('Latest historical row is a verified final session close',value=False,key='em_verified_close')
+manual_snapshot=None
+if use_intraday and manual_high>0 and manual_low>0 and manual_high>=manual_low:
+    manual_snapshot={'date':actual_date,'high':manual_high,'low':manual_low,'last':manual_last if manual_last>0 else np.nan}
+verified_final_date=actual_date if verify_close else None
+emr=expected_move_regime(h_view,verified_final_date=verified_final_date,intraday=manual_snapshot)
 cre=calendar_regime_engine(h_view,g_live,x_live,m,emr,gxs)
 
 with header_left:
@@ -711,14 +741,19 @@ with T3:
     if current:
         status='Completed' if current['Completed'] else 'In progress'
         st.markdown(f"**Latest week ({status}) — {current['Week']:%Y-%m-%d}**")
-        observed_status='EM BREACH' if not current['Inside EM'] else 'Inside observed band'
+        observed_status=emr['intraday_status']
         st.markdown(f"""<div class="emr-grid current-em-grid">
           <div class="emr-card"><div class="emr-label">Frozen lower / upper</div><div class="emr-value emr-regime">{current['Lower EM']:,.1f}<br/>{current['Upper EM']:,.1f}</div></div>
           <div class="emr-card"><div class="emr-label">Daily closing breaches</div><div class="emr-value">{current['Close Breaches']}</div></div>
           <div class="emr-card"><div class="emr-label">Consecutive closing breaches</div><div class="emr-value">{current['Consecutive Close Breaches']}</div></div>
           <div class="emr-card"><div class="emr-label">Observed status</div><div class="emr-value emr-regime">{observed_status}</div></div>
         </div>""", unsafe_allow_html=True)
-        st.caption(f"Anchor: {current['Date']:%Y-%m-%d}. Coverage: {current['Basis']}. Last close: {current['Last Close']:,.2f}.")
+        st.caption(f"Anchor: {current['Date']:%Y-%m-%d}. Coverage: {current['Basis']}. Last verified close: {fmt_price(current['Last Close'])}.")
+        k1,k2,k3=st.columns(3)
+        k1.metric('Intraday EM breach',emr['intraday_status'])
+        k2.metric('Closing EM breach',emr['closing_status'])
+        k3.metric('Re-entry inside EM',emr['reentry_status'])
+        if not current['Completed']:st.info('Current week remains IN PROGRESS until a later week is observed or the latest final close is explicitly verified.')
         if current['Basis']=='Daily closes only':
             st.warning('No complete daily high/low data: intraday containment cannot be verified. Inside EM means daily closes only.')
     if len(emr['weekly']):
@@ -727,7 +762,7 @@ with T3:
         st.dataframe(ew[['Week','Date','Close Price','Lower EM','Upper EM','EM',
                          'Observed High','Observed Low','EM Utilization',
                          'Close-to-Close Utilization','Close Breaches',
-                         'Consecutive Close Breaches','Inside EM','Completed','Basis']],
+                         'Consecutive Close Breaches','Intraday Breach','Closing Breach','Re-entry Inside EM','Inside EM','Completed','Basis']],
                      use_container_width=True,hide_index=True,height=455)
 
 with T4:
@@ -923,7 +958,7 @@ with T8:
                 em_amount=float(e.iloc[0].expected_move_amt) if len(e) else float(m['spot']*(iv7pct/100)*np.sqrt(days_left/365)) if pd.notna(iv7pct) else np.nan
                 a,b,c,d=st.columns(4)
                 direction=a.selectbox('Direction',['Both','Bearish put BWB','Bullish call BWB'],key='bwb_dir')
-                max_debit=b.number_input('Maximum natural debit ($)',min_value=50.,max_value=5000.,value=500.,step=50.,key='bwb_maxdebit')
+                max_debit=b.number_input('Maximum natural debit ($)',min_value=50.,max_value=5000.,value=250.,step=25.,key='bwb_maxdebit')
                 min_oi=c.number_input('Min OI per leg',min_value=0,max_value=5000,value=10,step=10,key='bwb_oi')
                 max_spread=d.slider('Max leg spread / mid',5,100,40,5,key='bwb_spread')/100
                 wing_choice=st.multiselect('Wing widths (SPX points)',[5,10,15,20,25,30,40,50,75,100],default=[5,10,15,20,25,30,40,50],key='bwb_wings')
@@ -946,6 +981,30 @@ with T8:
                     st.warning('Selected expiration has nonnegative net GEX. Directional expansion needs stronger confirmation; do not treat this as a verified negative-gamma regime.')
                 if pd.notna(ratio) and ratio>=1:
                     st.warning('IV7/HV5 is not below 1.0. Cheap-volatility qualification is not met under the current heuristic.')
+                st.markdown('#### Weekly expected-move expansion alert')
+                cur=emr.get('current')
+                if cur is None:
+                    st.info('EM expansion alert unavailable: insufficient weekly history.')
+                else:
+                    breach=cur.get('Intraday Breach')
+                    if breach is None:
+                        st.info('EM breach unverified: supply a session high/low in the sidebar or upload historical High/Low data.')
+                    elif not breach:
+                        st.info('No verified intraday EM breach. Monitor frozen weekly boundaries before treating this as expansion.')
+                    else:
+                        st.warning(f"Intraday weekly EM BREACH detected. Lower {cur['Lower EM']:,.2f} / upper {cur['Upper EM']:,.2f}. Closing status: {emr['closing_status']}. Re-entry: {emr['reentry_status']}.")
+                        if result.empty:
+                            st.info('No priced butterfly candidate currently passes negative path-GEX and other filters.')
+                        else:
+                            # Only candidate paths whose direction matches the actual EM breach qualify.
+                            breached_down=cur['Observed Low']<cur['Lower EM']
+                            breached_up=cur['Observed High']>cur['Upper EM']
+                            aligned=result[((result['Type']=='PUT') & breached_down) | ((result['Type']=='CALL') & breached_up)]
+                            aligned=aligned[aligned['Path Net GEX'].notna() & (aligned['Path Net GEX']<0)]
+                            if len(aligned):
+                                st.success(f'EM EXPANSION ALERT: {len(aligned):,} direction-aligned BWB candidates with negative path GEX. Verify live quotes and price-action confirmation.')
+                            else:
+                                st.info('EM breach confirmed, but no direction-aligned negative-path-GEX candidate passes current filters: WAIT.')
                 if result.empty:
                     st.info('WAIT / REJECT: No candidate passes the selected pricing, gamma-path and reachability constraints. Try viewing candidates without the negative-path requirement to diagnose the bottleneck.')
                 else:
