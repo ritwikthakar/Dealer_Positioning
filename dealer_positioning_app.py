@@ -172,6 +172,7 @@ def usable_em(em, asof, min_dte=3):
 
 def classify(df):
     c=set(df.columns)
+    if {'type','strike','expiration_date','bid','ask','implied_volatility'}.issubset(c): return 'option_chain'
     if {'strike','call_gex','put_gex','net_gex'}.issubset(c): return 'gex_strike'
     if {'Date','Close Price','GEX Net OI','DEX Net OI'}.issubset(c): return 'history'
     if {'expiration','net_gex','call_gex','put_gex','gamma_flip'}.issubset(c): return 'gex'
@@ -488,10 +489,10 @@ def level_table(m,g,x,em,f,u):
 
 # ---------- Sidebar / load ----------
 st.title('🎯 Dealer Positioning Command Center')
-st.caption('Regime → Positioning → Flow → Levels → Setup  •  Six required files + optional GEX-by-strike enhancement')
+st.caption('Regime → Positioning → Flow → Levels → Setup  •  Six required files + optional GEX-by-strike and option-chain enhancements')
 with st.sidebar:
     st.header('Data')
-    uploads=st.file_uploader('Drop 6 required CSVs + optional GEX-by-strike CSV',type='csv',accept_multiple_files=True,help='Files are identified automatically from their columns.')
+    uploads=st.file_uploader('Drop 6 required CSVs + optional GEX-by-strike and option-chain CSVs',type='csv',accept_multiple_files=True,help='Files are identified automatically from their columns.')
     use_demo=st.toggle('Use bundled COIN files',value=not bool(uploads))
     st.link_button(
         "⚡ Convexity Screener",
@@ -617,7 +618,7 @@ cards=f'''
 </div>'''
 st.markdown(cards,unsafe_allow_html=True)
 
-T1,T2,T3,T4,T5,T6,T7=st.tabs(['🎯 Command Center','🧭 Calendar Regime Engine','↔ Expected Move Regime','📈 Historical Regime','🧲 Dealer Positioning','🌊 Flow Intelligence','🔬 Strike Explorer'])
+T1,T2,T3,T4,T5,T6,T7,T8=st.tabs(['🎯 Command Center','🧭 Calendar Regime Engine','↔ Expected Move Regime','📈 Historical Regime','🧲 Dealer Positioning','🌊 Flow Intelligence','🔬 Strike Explorer','🦋 Broken-Wing Butterfly'])
 
 with T1:
     a,b,c=st.columns([1,1,2])
@@ -789,3 +790,182 @@ with T7:
     left,right=st.columns(2); left.markdown('**Flow at strike**'); left.dataframe(sf.sort_values('Premium',ascending=False),use_container_width=True,hide_index=True); right.markdown('**Unusual activity at strike**'); right.dataframe(su.sort_values('Vol/OI',ascending=False),use_container_width=True,hide_index=True)
 
 st.divider(); st.caption('Dealer positioning is an analytical map, not a prediction. Flow side and multi-leg prints can be ambiguous; use price/TA confirmation before interpreting a level as support or resistance.')
+# ---------- Broken-wing butterfly research engine ----------
+def bfly_chain(raw):
+    q=raw.copy()
+    q.columns=[str(c).strip().lower() for c in q.columns]
+    required={'type','strike','expiration_date','bid','ask','implied_volatility'}
+    if not required.issubset(q.columns):
+        raise ValueError('Option chain missing: '+', '.join(sorted(required-set(q.columns))))
+    for c in ['strike','bid','ask','mid','implied_volatility','open_interest','volume','delta','gamma','theta','vega']:
+        if c in q: q[c]=q[c].map(num)
+    q['type']=q['type'].astype(str).str.upper().str.strip()
+    q['expiry']=pd.to_datetime(q['expiration_date'].astype(str).str.split(':').str[0],errors='coerce').dt.normalize()
+    q=q[q['type'].isin(['PUT','CALL']) & q['expiry'].notna()].copy()
+    q=q[q['strike'].notna() & q['bid'].notna() & q['ask'].notna() & (q['bid']>=0) & (q['ask']>=q['bid'])].copy()
+    q['mid']=(q['bid']+q['ask'])/2
+    q=q.drop_duplicates(['expiry','type','strike'],keep='first')
+    return q
+
+def bfly_payoff(spot,typ,klo,kmid,khi,debit):
+    # A put BWB: +P(khi)-2P(kmid)+P(klo). Call BWB: +C(klo)-2C(kmid)+C(khi).
+    s=np.asarray(spot,dtype=float)
+    if typ=='PUT': intrinsic=np.maximum(khi-s,0)-2*np.maximum(kmid-s,0)+np.maximum(klo-s,0)
+    else: intrinsic=np.maximum(s-klo,0)-2*np.maximum(s-kmid,0)+np.maximum(s-khi,0)
+    return (intrinsic-debit)*100
+
+def bfly_black_scholes(spot,strike,t,vol,typ,r=0.0):
+    from scipy.stats import norm
+    s=np.asarray(spot,dtype=float)
+    t=max(float(t),0)
+    if t<=0: return np.maximum((s-strike) if typ=='CALL' else (strike-s),0)
+    vol=max(float(vol),.0001)
+    root=np.sqrt(t); d1=(np.log(np.maximum(s,1e-9)/strike)+(r+.5*vol**2)*t)/(vol*root)
+    d2=d1-vol*root
+    if typ=='CALL': return s*norm.cdf(d1)-strike*np.exp(-r*t)*norm.cdf(d2)
+    return strike*np.exp(-r*t)*norm.cdf(-d2)-s*norm.cdf(-d1)
+
+def bfly_candidates(chain,expiry,spot,typ,targets,em_amt,gxs,wing_sizes,max_debit,spread_cap,min_oi,allow_credit=False):
+    q=chain[(chain['expiry']==pd.Timestamp(expiry)) & (chain['type']==typ)].copy()
+    if q.empty:return pd.DataFrame()
+    q=q.set_index('strike',drop=False)
+    q=q[~q.index.duplicated(keep='first')]
+    strikes=np.array(sorted(q.index.to_numpy(dtype=float)))
+    if gxs is not None and not gxs.empty:
+        gz=gxs.copy()
+        gz['strike']=gz['strike'].map(num);gz['net_gex']=gz['net_gex'].map(num)
+        gz=gz.dropna(subset=['strike','net_gex']).groupby('strike',as_index=False)['net_gex'].sum().sort_values('strike')
+    else: gz=pd.DataFrame(columns=['strike','net_gex'])
+    rows=[]
+    for body in targets:
+        if body not in q.index:continue
+        for lower_width in wing_sizes:
+            for upper_width in wing_sizes:
+                if lower_width==upper_width:continue
+                klo=body-lower_width; khi=body+upper_width
+                if klo not in q.index or khi not in q.index:continue
+                # Restrict to the useful broken-wing orientation: overshoot on the intended directional side
+                if typ=='PUT' and upper_width<=lower_width:continue
+                if typ=='CALL' and lower_width<=upper_width:continue
+                legs=[q.loc[klo],q.loc[body],q.loc[khi]]
+                if any(z.get('open_interest',0)<min_oi for z in legs):continue
+                if any(z['ask']<=0 or (z['ask']-z['bid'])/max(z['mid'],.01)>spread_cap for z in legs):continue
+                debit_mid=float(legs[0]['mid']-2*legs[1]['mid']+legs[2]['mid'])
+                debit_nat=float(legs[0]['ask']-2*legs[1]['bid']+legs[2]['ask'])
+                if debit_nat*100>max_debit or debit_nat<=0 or (debit_mid<=0 and not allow_credit):continue
+                # Worst-case max loss and max gain across all piecewise-linear knots and tails.
+                test_spots=np.array([0.,klo,body,khi,max(spot,khi)*2])
+                payoff=bfly_payoff(test_spots,typ,klo,body,khi,debit_nat)
+                max_loss=float(max(0,-payoff.min())); max_profit=float(payoff.max())
+                if max_loss<=0:continue
+                path_low=min(spot,body);path_high=max(spot,body)
+                path=gz[(gz.strike>=path_low)&(gz.strike<=path_high)]
+                path_total=path.net_gex.sum() if len(path) else np.nan
+                path_negative_share=float(path.loc[path.net_gex<0,'net_gex'].abs().sum()/path.net_gex.abs().sum()) if len(path) and path.net_gex.abs().sum()>0 else np.nan
+                distance=abs(body-spot)
+                reach=distance/em_amt if pd.notna(em_amt) and em_amt>0 else np.nan
+                rows.append({'Direction':'Bearish' if typ=='PUT' else 'Bullish','Type':typ,'Long Lower':klo,'Short Body':body,'Long Upper':khi,
+                             'Lower Wing':lower_width,'Upper Wing':upper_width,'Mid Debit $':debit_mid*100,'Natural Debit $':debit_nat*100,
+                             'Max Loss $':max_loss,'Max Profit $':max_profit,'Reward / Risk':max_profit/max_loss,
+                             'Body Distance':distance,'Distance / EM':reach,'Path Net GEX':path_total,'Path Negative Share':path_negative_share,
+                             'Body Expiry P/L $':float(bfly_payoff(body,typ,klo,body,khi,debit_nat)),
+                             'Overshoot P/L $':float(bfly_payoff(0 if typ=='PUT' else 2*khi,typ,klo,body,khi,debit_nat)),
+                             'Quote Cost / Wing %':100*debit_nat/max(lower_width,upper_width),
+                             'Leg IVs':tuple(float(z['implied_volatility']) for z in legs),
+                             'Leg Mid':tuple(float(z['mid']) for z in legs)})
+    return pd.DataFrame(rows)
+
+with T8:
+    st.subheader('🦋 SPX Broken-Wing Butterfly Lab')
+    st.caption('Research tool: IV/HV → dealer gamma path → reachable body strike → quoted 1:-2:1 butterfly → expiration and early-exit scenarios. Quotes are snapshots, not firm executable prices.')
+    raw_chain=data.get('option_chain')
+    if raw_chain is None:
+        st.info('Upload the eighth CSV: SPX option chain with type, strike, expiration_date, bid, ask and implied_volatility. Your seven original datasets remain supported.')
+    else:
+        try:
+            chain=bfly_chain(raw_chain)
+            st.info('Option-chain prices are from the uploaded snapshot. Selecting an earlier analysis date does not reconstruct historical option quotes or historical strike-level GEX.')
+            dates=sorted(pd.Timestamp(d).date() for d in chain.expiry.dropna().unique() if pd.Timestamp(d).date()>actual_date)
+            if not dates: st.warning('No option-chain expirations after the analysis date.')
+            else:
+                exp=st.selectbox('Butterfly expiration',dates,key='bwb_exp')
+                days_left=(exp-actual_date).days
+                q=chain[chain.expiry==pd.Timestamp(exp)]
+                close=pd.to_numeric(h_view['Close Price'],errors='coerce').dropna()
+                hv5=close.pct_change().tail(5).std(ddof=1)*np.sqrt(252)*100 if len(close)>=7 else np.nan
+                hv10=close.pct_change().tail(10).std(ddof=1)*np.sqrt(252)*100 if len(close)>=12 else np.nan
+                hv20=close.pct_change().tail(20).std(ddof=1)*np.sqrt(252)*100 if len(close)>=22 else np.nan
+                iv7=num(h_view.iloc[-1].get('IV 7d',np.nan))
+                iv7pct=iv7 if pd.notna(iv7) else np.nan
+                ratio=iv7pct/hv5 if pd.notna(hv5) and hv5>0 else np.nan
+                matched=g_live[pd.to_datetime(g_live.expiration_dt).dt.date==exp]
+                expiry_gex=matched.net_gex.sum() if len(matched) else np.nan
+                c1,c2,c3,c4,c5=st.columns(5)
+                c1.metric('IV 7d',f'{iv7pct:.2f}%' if pd.notna(iv7pct) else '—')
+                c2.metric('HV5',f'{hv5:.2f}%' if pd.notna(hv5) else '—')
+                c3.metric('IV7 / HV5',f'{ratio:.2f}' if pd.notna(ratio) else '—')
+                c4.metric('Expiry net GEX',fmt_money(expiry_gex))
+                c5.metric('Chain coverage',f'{len(q):,} contracts')
+                st.caption(f'HV10: {hv10:.2f}% • HV20: {hv20:.2f}% • {days_left} calendar days to expiry. IV7/HV5 is an approximate short-horizon comparison, not a forward volatility forecast.')
+                e=em[(em.date.dt.date==exp)]
+                em_amount=float(e.iloc[0].expected_move_amt) if len(e) else float(m['spot']*(iv7pct/100)*np.sqrt(days_left/365)) if pd.notna(iv7pct) else np.nan
+                a,b,c,d=st.columns(4)
+                direction=a.selectbox('Direction',['Both','Bearish put BWB','Bullish call BWB'],key='bwb_dir')
+                max_debit=b.number_input('Maximum natural debit ($)',min_value=50.,max_value=5000.,value=500.,step=50.,key='bwb_maxdebit')
+                min_oi=c.number_input('Min OI per leg',min_value=0,max_value=5000,value=10,step=10,key='bwb_oi')
+                max_spread=d.slider('Max leg spread / mid',5,100,40,5,key='bwb_spread')/100
+                wing_choice=st.multiselect('Wing widths (SPX points)',[5,10,15,20,25,30,40,50,75,100],default=[5,10,15,20,25,30,40,50],key='bwb_wings')
+                require_neg=st.checkbox('Require negative path GEX for expansion candidates',value=True,key='bwb_neg')
+                only_reach=st.slider('Max body distance / expected move',.25,2.5,1.25,.05,key='bwb_reach')
+                st.caption('Negative path GEX is a research filter based on static strike exposure, not a simulated dealer hedge response. Technical breakout confirmation is not supplied by these CSVs.')
+                chain_strikes=sorted(set(q['strike'].to_numpy(float)))
+                possible=[k for k in chain_strikes if abs(k-m['spot'])<=max(2*em_amount if pd.notna(em_amount) else 150,60)]
+                # Keep the search bounded; only standard 5-point body locations.
+                targets=[k for k in possible if np.isclose(k/5,round(k/5))]
+                modes=[]
+                if direction!='Bullish call BWB':modes.append('PUT')
+                if direction!='Bearish put BWB':modes.append('CALL')
+                result=pd.concat([bfly_candidates(chain,pd.Timestamp(exp),m['spot'],typ,targets,em_amount,gxs,wing_choice,max_debit,max_spread,min_oi) for typ in modes],ignore_index=True)
+                if not result.empty:
+                    if require_neg:result=result[result['Path Net GEX'].notna() & (result['Path Net GEX']<0)]
+                    if pd.notna(em_amount):result=result[result['Distance / EM']<=only_reach]
+                    result=result[result['Max Profit $']>0].copy()
+                if pd.notna(expiry_gex) and expiry_gex>=0:
+                    st.warning('Selected expiration has nonnegative net GEX. Directional expansion needs stronger confirmation; do not treat this as a verified negative-gamma regime.')
+                if pd.notna(ratio) and ratio>=1:
+                    st.warning('IV7/HV5 is not below 1.0. Cheap-volatility qualification is not met under the current heuristic.')
+                if result.empty:
+                    st.info('WAIT / REJECT: No candidate passes the selected pricing, gamma-path and reachability constraints. Try viewing candidates without the negative-path requirement to diagnose the bottleneck.')
+                else:
+                    result['Ranking Metric']=result['Reward / Risk'].clip(upper=15)/(1+result['Distance / EM'].fillna(2))
+                    result=result.sort_values(['Ranking Metric','Natural Debit $'],ascending=[False,True]).reset_index(drop=True)
+                    st.metric('Candidates passing',f'{len(result):,}')
+                    cols=['Direction','Long Lower','Short Body','Long Upper','Natural Debit $','Mid Debit $','Max Loss $','Max Profit $','Reward / Risk','Distance / EM','Path Net GEX','Path Negative Share','Overshoot P/L $']
+                    st.dataframe(result[cols].head(150),use_container_width=True,hide_index=True)
+                    st.download_button('Download butterfly candidates',result.drop(columns=['Leg IVs','Leg Mid']).to_csv(index=False).encode(),'spx_broken_wing_candidates.csv','text/csv')
+                    idx=st.selectbox('Inspect candidate',list(range(min(100,len(result)))),format_func=lambda i:f"{result.iloc[i]['Direction']} | {result.iloc[i]['Long Lower']:,.0f} / {result.iloc[i]['Short Body']:,.0f} / {result.iloc[i]['Long Upper']:,.0f} | ${result.iloc[i]['Natural Debit $']:,.0f} natural",key='bwb_pick')
+                    row=result.iloc[idx];typ=row['Type'];kl=row['Long Lower'];kb=row['Short Body'];kh=row['Long Upper'];debit=row['Natural Debit $']/100
+                    grid=np.linspace(min(kl,m['spot'])-max(20,em_amount*.4),max(kh,m['spot'])+max(20,em_amount*.4),251)
+                    expiry_pnl=bfly_payoff(grid,typ,kl,kb,kh,debit)
+                    fig=go.Figure(go.Scatter(x=grid,y=expiry_pnl,name='Expiration P/L'))
+                    fig.add_hline(y=0,line_dash='dash');fig.add_vline(x=m['spot'],line_dash='dot',annotation_text='Spot');fig.add_vline(x=kb,line_dash='dot',annotation_text='Body')
+                    fig.update_layout(height=390,title='Expiration P/L — conservative natural-entry debit',xaxis_title='SPX at expiry',yaxis_title='P/L ($)')
+                    st.plotly_chart(fig,use_container_width=True)
+                    st.markdown('#### Early-exit scenario (theoretical, not executable)')
+                    t1,t2,t3=st.columns(3)
+                    exit_days=t1.slider('Trading days held',0,max(1,min(5,days_left)),2,key='bwb_days')
+                    iv_shift=t2.slider('Parallel IV change (vol points)',-8.,8.,0.,.5,key='bwb_ivshift')
+                    annual_rate=t3.number_input('Risk-free annual rate (%)',min_value=0.,max_value=15.,value=4.,step=.25,key='bwb_rate')/100
+                    rem_t=max((days_left-exit_days*7/5)/365,0)
+                    vols=row['Leg IVs']
+                    # Price at hypothetical exit is model value; actual exit fills will differ.
+                    values=[bfly_black_scholes(grid,k,rem_t,max(v+iv_shift/100,.0001),typ,annual_rate) for k,v in zip((kl,kb,kh),vols)]
+                    model_pnl=(values[0]-2*values[1]+values[2]-debit)*100
+                    fig2=go.Figure(go.Scatter(x=grid,y=model_pnl,name='Model exit P/L'))
+                    fig2.add_hline(y=0,line_dash='dash');fig2.add_vline(x=m['spot'],line_dash='dot',annotation_text='Spot');fig2.add_vline(x=kb,line_dash='dot',annotation_text='Body')
+                    fig2.update_layout(height=390,title=f'Theoretical P/L after {exit_days} trading days | IV shift {iv_shift:+.1f} pts',xaxis_title='SPX at exit',yaxis_title='Modeled P/L ($)')
+                    st.plotly_chart(fig2,use_container_width=True)
+                    st.caption('Scenario uses per-leg snapshot IV held constant except for a parallel shift, Black–Scholes European pricing, a user-set risk-free rate, and an approximate trading-day/calendar-day conversion. It excludes closing slippage, fees, volatility skew changes, and evolving GEX. No modeled profit is guaranteed.')
+        except Exception as exc:
+            st.error(f'Broken-wing analysis could not run: {exc}')
+
