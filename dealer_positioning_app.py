@@ -643,7 +643,7 @@ cards=f'''
   <div class="dp-card gex"><div class="dp-label"><span class="dp-icon">↗</span>Net GEX</div><div class="dp-value">{fmt_money(m['gex'])}</div><div class="dp-delta">{'↑' if m['dg']>=0 else '↓'} {fmt_money(m['dg'])} (1D)</div><div class="dp-sub">Prev: {fmt_money(prev_gex)}<br>{'5D Change: '+fmt_money(g5) if pd.notna(g5) else ''}</div></div>
   <div class="dp-card dex"><div class="dp-label"><span class="dp-icon">▤</span>Net DEX</div><div class="dp-value">{fmt_money(m['dex'])}</div><div class="dp-delta">{'↑' if m['dd']>=0 else '↓'} {fmt_money(m['dd'])} (1D)</div><div class="dp-sub">Prev: {fmt_money(prev_dex)}<br>{'5D Change: '+fmt_money(d5) if pd.notna(d5) else ''}</div></div>
   <div class="dp-card iv"><div class="dp-label"><span class="dp-icon">%</span>IV30 / IV Rank</div><div class="dp-value">{m['iv']:.2f}%</div><div class="dp-delta">IV Rank: {m['ivr']:.2f}%</div><div class="dp-sub">Current 30-day implied volatility and its historical rank.</div></div>
-  <div class="dp-card flip"><div class="dp-label"><span class="dp-icon">⊕</span>Gamma Flip</div><div class="dp-value">{fmt_price(m['gamma_flip'])}</div><div class="dp-delta">Spot: {fmt_price(m['spot'])}</div><div class="dp-sub">Distance: {((m['spot']/m['gamma_flip'])-1):+.1%} ({m['spot']-m['gamma_flip']:+.2f})<br>{m['flip_src']}</div></div>
+  <div class="dp-card flip"><div class="dp-label"><span class="dp-icon">⊕</span>Aggregate Gamma Flip</div><div class="dp-value">{fmt_price(m['gamma_flip'])}</div><div class="dp-delta">Spot: {fmt_price(m['spot'])}</div><div class="dp-sub">Distance: {((m['spot']/m['gamma_flip'])-1):+.1%} ({m['spot']-m['gamma_flip']:+.2f})<br>{m['flip_src']}</div></div>
   <div class="dp-card em"><div class="dp-label"><span class="dp-icon">▣</span>Expected Move</div><div class="dp-value">{fmt_price(firstem.lower_price)} –<br>{fmt_price(firstem.upper_price)}</div><div class="dp-delta">{em_tag}</div><div class="dp-sub">Range: ± {fmt_price(em_amt).replace('$','')}<br>{f'({em_pct:.2f}%)' if pd.notna(em_pct) else ''}</div></div>
 </div>'''
 st.markdown(cards,unsafe_allow_html=True)
@@ -790,6 +790,31 @@ with T5:
     filt=pos[(pos.DTE>=min_dte)&(pos.DTE<=max_dte_sel)].copy()
     filt=filt[((filt.net_gex>=0)&('Positive' in gsign))|((filt.net_gex<0)&('Negative' in gsign))]
     filt=filt[((filt.net_dex>=0)&('Positive' in dsign))|((filt.net_dex<0)&('Negative' in dsign))]
+    # Expiration-specific dealer levels: linked to the Command Center's
+    # "Expected move to" selection, but selectable independently here.
+    # Use only live, filtered expirations; do not include expired 0DTE rows.
+    st.markdown('#### Dealer Levels — Selected Expiration')
+    eligible=filt[filt['DTE']>0].dropna(subset=['expiration_dt']).copy()
+    if eligible.empty:
+        st.info('No active expiration matches these filters. Adjust DTE or GEX/DEX sign filters to see dealer levels.')
+    else:
+        eligible=eligible.sort_values('expiration_dt').drop_duplicates('expiration_dt')
+        available_dates=list(pd.to_datetime(eligible['expiration_dt']).dt.date)
+        default_exp=em_pick if 'em_pick' in locals() and em_pick in available_dates else available_dates[0]
+        chosen_exp=st.selectbox(
+            'Dealer levels for expiration', available_dates,
+            index=available_dates.index(default_exp),
+            format_func=lambda d:f'{d:%b %d, %Y} ({_dte(d)} DTE)',
+            key='dealer_levels_exp',
+            help='Defaults to the Expected move to expiration when it passes the table filters. Select another active expiration to compare levels.'
+        )
+        chosen=eligible.loc[pd.to_datetime(eligible['expiration_dt']).dt.date==chosen_exp].iloc[0]
+        wall_cols=st.columns(4)
+        wall_cols[0].metric('Put Wall',fmt_price(chosen['put_wall_gex']))
+        wall_cols[1].metric('Call Wall',fmt_price(chosen['call_wall_gex']))
+        wall_cols[2].metric('Gamma Flip',fmt_price(chosen['gamma_flip']))
+        wall_cols[3].metric('Expiration Net GEX',fmt_money(chosen['net_gex']))
+        st.caption(f'Selected: {chosen_exp:%b %d, %Y} · {int(chosen["DTE"])} DTE. These are expiration-specific GEX levels, not the aggregate gamma flip on the Command Center. Source: uploaded positioning files.')
     disp=filt[['expiration_dt','DTE','net_gex','net_dex','call_gex','put_gex','call_dex','put_dex','call_wall_gex','put_wall_gex','gamma_flip','Expected Move','GEX Share','DEX Share']].copy()
     disp.columns=['Expiration','DTE','Net GEX','Net DEX','Call GEX','Put GEX','Call DEX','Put DEX','Call Wall','Put Wall','Gamma Flip','Expected Move','GEX Share','DEX Share']
     st.dataframe(disp,use_container_width=True,hide_index=True,column_config={'GEX Share':st.column_config.ProgressColumn(format='%.1%%',min_value=0,max_value=1),'DEX Share':st.column_config.ProgressColumn(format='%.1%%',min_value=0,max_value=1)})
