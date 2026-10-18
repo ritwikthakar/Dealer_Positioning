@@ -319,7 +319,10 @@ def expected_move_regime(h, verified_final_date=None, intraday=None):
 
 def regime_metrics(h,g,x,em,f,u,gxs=None):
     last=h.iloc[-1]; prev=h.iloc[-2] if len(h)>1 else last
-    spot=first_valid(last.get('Close Price'), f['Price~'].dropna().iloc[-1] if f['Price~'].notna().any() else np.nan)
+    spot = first_valid(
+    f['Price~'].dropna().iloc[-1] if f['Price~'].notna().any() else np.nan,
+    last.get('Close Price')
+   )
     gex=last.get('GEX Net OI',np.nan); dex=last.get('DEX Net OI',np.nan)
     dg=gex-prev.get('GEX Net OI',gex); dd=dex-prev.get('DEX Net OI',dex)
     iv=last.get('IV 30d',np.nan); ivr=last.get('IV Rank',np.nan)
@@ -617,7 +620,7 @@ if em_dates:
     em_tag=f'{em_pick:%b %d} · {_dte(em_pick)} DTE'
 else:
     firstem=em_live.iloc[0]; em_tag=f'{firstem.date:%b %d}'
-prev_close=h_view.iloc[-2]['Close Price'] if len(h_view)>1 else np.nan
+close_badge = f"Close: {fmt_price(m['spot'])}"
 close_chg=m['spot']-prev_close if pd.notna(prev_close) else np.nan
 close_pct=(close_chg/prev_close) if pd.notna(prev_close) and prev_close else np.nan
 close_badge=f"Close: {fmt_price(m['spot'])}"
