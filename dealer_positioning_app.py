@@ -621,6 +621,7 @@ if em_dates:
 else:
     firstem=em_live.iloc[0]; em_tag=f'{firstem.date:%b %d}'
 close_badge = f"Close: {fmt_price(m['spot'])}"
+prev_close = h_view.iloc[-2]['Close Price'] if len(h_view) > 1 else np.nan
 close_chg=m['spot']-prev_close if pd.notna(prev_close) else np.nan
 close_pct=(close_chg/prev_close) if pd.notna(prev_close) and prev_close else np.nan
 close_badge=f"Close: {fmt_price(m['spot'])}"
