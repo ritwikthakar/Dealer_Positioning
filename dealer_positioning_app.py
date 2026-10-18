@@ -107,7 +107,7 @@ def live_expirations(g, x, asof, min_share=MIN_EXP_SHARE):
     asof=pd.Timestamp(asof).normalize()
     def keep(df, cols):
         d=df[pd.to_datetime(df['expiration_dt']).dt.normalize()>asof].copy()
-        if d.empty: return df.sort_values('expiration_dt').copy()
+        if d.empty: return df.iloc[0:0].copy()  # Never resurrect expired expirations
         gross=sum(d[c].abs().fillna(0) for c in cols)
         k=d[gross/max(gross.sum(),1e-9)>=min_share]
         return (k if len(k) else d).sort_values('expiration_dt')
@@ -251,6 +251,7 @@ def expected_move_regime(h, verified_final_date=None, intraday=None):
         verified_date=pd.Timestamp(verified_final_date).date() if verified_final_date is not None else None
         is_final=i<len(groups)-1 or (verified_date is not None and days['Date'].iloc[-1].date()==verified_date)
         # For the current unfinished week, do not claim its last observation was a close.
+        # An unverified last observation must not be counted as a closing price.
         close_valid=close_sides if is_final else close_sides[:-1]
         consecutive=0;last_side=0
         for side in close_valid:
@@ -319,10 +320,8 @@ def expected_move_regime(h, verified_final_date=None, intraday=None):
 
 def regime_metrics(h,g,x,em,f,u,gxs=None):
     last=h.iloc[-1]; prev=h.iloc[-2] if len(h)>1 else last
-    spot = first_valid(
-    f['Price~'].dropna().iloc[-1] if f['Price~'].notna().any() else np.nan,
-    last.get('Close Price')
-   )
+    # Historical reference price: do not substitute an undated options-flow print.
+    spot = last.get('Close Price', np.nan)
     gex=last.get('GEX Net OI',np.nan); dex=last.get('DEX Net OI',np.nan)
     dg=gex-prev.get('GEX Net OI',gex); dd=dex-prev.get('DEX Net OI',dex)
     iv=last.get('IV 30d',np.nan); ivr=last.get('IV Rank',np.nan)
@@ -334,7 +333,7 @@ def regime_metrics(h,g,x,em,f,u,gxs=None):
     if np.sign(gex)!=np.sign(prev.get('GEX Net OI',gex)): reg='Gamma Regime Transition'
     # g/x are already filtered to live, material expirations (see live_expirations): no expired 0DTE chain.
     gg=g.sort_values('expiration_dt')
-    gr=gg.iloc[0]
+    gr=gg.iloc[0] if not gg.empty else pd.Series(dtype=float)
     # Aggregate gamma flip from the strike-level profile (zero crossing nearest spot); otherwise an
     # exposure-weighted flip across live expirations. Walls likewise come from the all-expiration strike file.
     flip=profile_flip(gxs,spot)
@@ -585,6 +584,9 @@ gxs=data.get('gex_strike')
 # Live, material expirations only (no expired 0DTE chain, no negligible-exposure expiries) and usable EM rows.
 g_live,x_live=live_expirations(g,x,actual_date)
 em_live=usable_em(em,actual_date)
+if g_live.empty or x_live.empty:
+    st.error('No valid future GEX/DEX expirations for the selected analysis date. Upload a newer positioning snapshot; expired data will not be reused.')
+    st.stop()
 m=regime_metrics(h_view,g_live,x_live,em_live,f,u,gxs); levels=level_table(m,g_live,x_live,em_live,f,u)
 # Optional verified intraday data. Never silently equate a last quote to a close.
 with st.sidebar.expander('Weekly EM: intraday / verified close',expanded=False):
@@ -600,6 +602,12 @@ if use_intraday and manual_high>0 and manual_low>0 and manual_high>=manual_low:
 verified_final_date=actual_date if verify_close else None
 emr=expected_move_regime(h_view,verified_final_date=verified_final_date,intraday=manual_snapshot)
 cre=calendar_regime_engine(h_view,g_live,x_live,m,emr,gxs)
+
+with st.expander('🔎 Data Integrity — source and date checks', expanded=False):
+    st.write(f'History last observation: **{actual_date}** · Historical reference price: **{fmt_price(m["spot"])}**')
+    st.write(f'GEX future expirations: **{len(g_live)}** · DEX future expirations: **{len(x_live)}** · Usable EM rows: **{len(em_live)}**')
+    st.write(f'Flow rows: **{len(f):,}** · Unusual rows: **{len(u):,}** · GEX-by-strike: **{"loaded" if gxs is not None else "missing"}**')
+    st.warning('GEX/DEX, flow, unusual, option-chain and GEX-by-strike files are uploaded snapshots, not historical time series. The Analysis Date selector cannot reconstruct their earlier states. Verify that all files were exported for the same session before relying on regime or BWB signals.')
 
 with header_left:
     st.subheader(f'{ticker} • {actual_date}')
@@ -620,13 +628,15 @@ if em_dates:
     em_tag=f'{em_pick:%b %d} · {_dte(em_pick)} DTE'
 else:
     firstem=em_live.iloc[0]; em_tag=f'{firstem.date:%b %d}'
-close_badge = f"Close: {fmt_price(m['spot'])}"
-prev_close = h_view.iloc[-2]['Close Price'] if len(h_view) > 1 else np.nan
-close_chg=m['spot']-prev_close if pd.notna(prev_close) else np.nan
-close_pct=(close_chg/prev_close) if pd.notna(prev_close) and prev_close else np.nan
-close_badge=f"Close: {fmt_price(m['spot'])}"
+prev_close = h_view.iloc[-2]['Close Price'] if len(h_view)>1 else np.nan
+close_chg = m['spot']-prev_close if pd.notna(m['spot']) and pd.notna(prev_close) else np.nan
+close_pct = close_chg/prev_close if pd.notna(close_chg) and prev_close else np.nan
+close_badge=f"Historical reference: {fmt_price(m['spot'])}"
 if pd.notna(close_chg): close_badge += f" &nbsp; {'▲' if close_chg>=0 else '▼'} {close_chg:+.2f} ({close_pct:+.2%})"
 st.markdown(f'<div class="dp-close">{close_badge}</div>',unsafe_allow_html=True)
+flow_prices = pd.to_numeric(f.get('Price~',pd.Series(dtype=float)),errors='coerce').dropna()
+if not flow_prices.empty:
+    st.caption(f'Options-flow reference: {fmt_price(flow_prices.iloc[-1])} (print time not verified). Historical reference is sourced from option-history Close Price; it is not independently verified as an official session close.')
 
 prev_gex=h_view.iloc[-2]['GEX Net OI'] if len(h_view)>1 else np.nan
 prev_dex=h_view.iloc[-2]['DEX Net OI'] if len(h_view)>1 else np.nan
@@ -771,7 +781,7 @@ with T3:
 
 with T4:
     days=st.segmented_control('Window',['20D','60D','All'],default='60D')
-    hh=h.tail(20 if days=='20D' else 60 if days=='60D' else len(h))
+    hh=h_view.tail(20 if days=='20D' else 60 if days=='60D' else len(h_view))
     fig=go.Figure(); fig.add_trace(go.Scatter(x=hh.Date,y=hh['Close Price'],name='Close')); fig.add_trace(go.Scatter(x=hh.Date,y=hh['Max Pain 1d'],name='Max Pain',line=dict(dash='dot'))); fig.update_layout(height=350,title='Price vs Max Pain'); st.plotly_chart(fig,use_container_width=True)
     col1,col2=st.columns(2)
     for col,y,title in [(col1,'GEX Net OI','Net GEX History'),(col2,'DEX Net OI','Net DEX History')]:
@@ -779,11 +789,11 @@ with T4:
     fig=go.Figure(); fig.add_trace(go.Scatter(x=hh.Date,y=hh['IV 30d'],name='IV30')); fig.add_trace(go.Scatter(x=hh.Date,y=hh['IV Rank'],name='IV Rank')); fig.update_layout(height=330,title='Volatility Regime'); st.plotly_chart(fig,use_container_width=True)
 
 with T5:
-    pos=pd.merge(g,x,on='expiration_dt',how='outer',suffixes=('_gex','_dex')).sort_values('expiration_dt')
+    pos=pd.merge(g_live,x_live,on='expiration_dt',how='outer',suffixes=('_gex','_dex')).sort_values('expiration_dt')
     pos['GEX Share']=pos.net_gex.abs()/max(pos.net_gex.abs().sum(),1); pos['DEX Share']=pos.net_dex.abs()/max(pos.net_dex.abs().sum(),1)
     analysis_date=pd.Timestamp(actual_date).normalize()
     pos['DTE']=(pd.to_datetime(pos['expiration_dt']).dt.normalize()-analysis_date).dt.days
-    em_map=em.copy(); em_map['date']=pd.to_datetime(em_map['date']).dt.normalize()
+    em_map=em_live.copy(); em_map['date']=pd.to_datetime(em_map['date']).dt.normalize()
     em_map['Expected Move']=em_map.apply(lambda r:f"{fmt_price(r['lower_price'])} – {fmt_price(r['upper_price'])} (±{fmt_price(r['expected_move_amt']).replace('$','')}, {r['expected_move_percentage']:.2f}%)",axis=1)
     pos=pos.merge(em_map[['date','Expected Move']],left_on=pd.to_datetime(pos['expiration_dt']).dt.normalize(),right_on='date',how='left').drop(columns=['date'])
 
@@ -1068,4 +1078,3 @@ with T8:
                     st.caption('Scenario uses per-leg snapshot IV held constant except for a parallel shift, Black–Scholes European pricing, a user-set risk-free rate, and an approximate trading-day/calendar-day conversion. It excludes closing slippage, fees, volatility skew changes, and evolving GEX. No modeled profit is guaranteed.')
         except Exception as exc:
             st.error(f'Broken-wing analysis could not run: {exc}')
-
