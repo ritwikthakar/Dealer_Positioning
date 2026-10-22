@@ -539,6 +539,49 @@ def expiry_strike_gex(chain, expiry, spot):
     a['net_gex']=a.call_gex+a.put_gex
     return a.sort_values('strike')
 
+# ---------- Yahoo Finance option chain (free, unofficial, via yfinance) ----------
+YAHOO_INDEX={'SPX':'^SPX','NDX':'^NDX','RUT':'^RUT','VIX':'^VIX','DJX':'^DJI'}
+
+def bs_gamma(spot, strike, t_years, iv, r=.04):
+    """Black-Scholes gamma. Yahoo supplies no greeks, so gamma is derived from its implied vol.
+    Time is floored at one hour and junk IVs (<1% or >300%, typical of dead/after-hours quotes) become NaN."""
+    s=float(spot); k=np.asarray(strike,float); t=np.maximum(np.asarray(t_years,float),1/(365*24)); v=np.asarray(iv,float)
+    vv=np.where(np.isfinite(v)&(v>=.01)&(v<=3),v,np.nan)
+    d1=(np.log(s/k)+(r+.5*vv**2)*t)/(vv*np.sqrt(t))
+    return np.exp(-.5*d1**2)/np.sqrt(2*np.pi)/(s*vv*np.sqrt(t))
+
+@st.cache_data(ttl=300,show_spinner='Fetching option chain from Yahoo Finance…')
+def fetch_yahoo_chain(symbol, n_exp, extra=''):
+    """Returns (chain_df, spot, fetched_at). Loads the first n_exp expirations plus `extra` (YYYY-MM-DD).
+    Columns are normalised to the app's option-chain schema; Yahoo IV is already a decimal."""
+    try: import yfinance as yf
+    except ImportError: raise RuntimeError('yfinance is not installed. Add "yfinance" to requirements.txt.')
+    t=yf.Ticker(symbol)
+    exps=list(t.options)
+    if not exps: raise RuntimeError(f'Yahoo returned no option expirations for "{symbol}". Check the symbol (index tickers need a caret, e.g. ^SPX).')
+    pick=exps[:n_exp]
+    if extra and extra in exps and extra not in pick: pick.append(extra)
+    spot=np.nan
+    try: spot=float(t.fast_info['last_price'])
+    except Exception:
+        try: spot=float(t.history(period='5d')['Close'].dropna().iloc[-1])
+        except Exception: pass
+    frames=[]
+    for e in pick:
+        try: oc=t.option_chain(e)
+        except Exception: continue
+        for typ,df in (('CALL',oc.calls),('PUT',oc.puts)):
+            if df is None or df.empty: continue
+            d=df.copy(); d['type']=typ; d['expiration_date']=e; frames.append(d)
+    if not frames: raise RuntimeError('Yahoo returned empty option chains (rate-limited or market data unavailable). Try Refresh in a minute.')
+    raw=pd.concat(frames,ignore_index=True).rename(columns={'openInterest':'open_interest','impliedVolatility':'implied_volatility','lastPrice':'last_price'})
+    for c in ['open_interest','volume','bid','ask']: raw[c]=pd.to_numeric(raw[c],errors='coerce').fillna(0)
+    now_et=pd.Timestamp.now(tz='America/New_York').tz_localize(None)
+    t_years=((pd.to_datetime(raw['expiration_date'])+pd.Timedelta(hours=16))-now_et).dt.total_seconds()/(365*86400)
+    raw['gamma']=bs_gamma(spot,raw['strike'],t_years,raw['implied_volatility']) if pd.notna(spot) else np.nan
+    cols=['type','strike','expiration_date','bid','ask','implied_volatility','open_interest','volume','last_price','gamma']
+    return raw[cols], spot, now_et.strftime('%b %d %H:%M ET')
+
 # =====================================================================================
 # SIDEBAR — all inputs live here; main page is for reading
 # =====================================================================================
@@ -592,6 +635,14 @@ with st.sidebar:
         em_pick=st.selectbox('Expected move to',em_dates,index=next((i for i,d in enumerate(em_dates) if _dte(d)>=3),0),
                              format_func=lambda d:f'{d:%b %d} ({_dte(d)} DTE)',key='em_target',
                              help='Drives the Expected Move card, dealer levels and the butterfly lab. Defaults to the first expiry ≥3 DTE.')
+    st.header('Option chain')
+    chain_src=st.radio('Source',['Yahoo Finance','Uploaded CSV'],key='chain_src',horizontal=True)
+    yh_symbol=yh_n=None
+    if chain_src=='Yahoo Finance':
+        yh_symbol=st.text_input('Yahoo symbol',value=YAHOO_INDEX.get(ticker.upper(),ticker.upper()),key='yh_symbol',
+                                help='Index tickers need a caret (^SPX). SPX weeklies are included in the ^SPX chain.')
+        yh_n=st.slider('Expirations to load',2,20,8,key='yh_n',help='Each expiration is one request to Yahoo; more = slower and more likely to be rate-limited.')
+        st.button('↻ Refresh quotes',on_click=fetch_yahoo_chain.clear,use_container_width=True)
     with st.expander('Weekly EM: intraday / verified close'):
         st.caption('Optional live-session values. High/low confirm an intraday breach; a last quote is not a verified close.')
         use_intraday=st.checkbox('Supply intraday observations',value=False,key='em_manual_enable')
@@ -612,6 +663,13 @@ manual_snapshot=None
 if use_intraday and manual_high>0 and manual_low>0 and manual_high>=manual_low:
     manual_snapshot={'date':actual_date,'high':manual_high,'low':manual_low,'last':manual_last if manual_last>0 else np.nan}
 verified_final_date=actual_date if verify_close else None
+
+chain_raw=None; chain_spot=np.nan; chain_stamp=''; chain_err=''
+if chain_src=='Yahoo Finance':
+    try: chain_raw,chain_spot,chain_stamp=fetch_yahoo_chain((yh_symbol or '').strip(),int(yh_n),em_pick.strftime('%Y-%m-%d') if em_pick else '')
+    except Exception as _ex: chain_err=str(_ex)
+else:
+    chain_raw=data.get('option_chain')
 
 m=regime_metrics(h_view,g_live,x_live,em_live,f,u,gxs); levels=level_table(m,g_live,x_live,em_live,f,u)
 emr=expected_move_regime(h_view,verified_final_date=verified_final_date,intraday=manual_snapshot)
@@ -637,7 +695,7 @@ if actual_date!=selected_date:
 with st.expander('🔎 Data checks',expanded=False):
     st.write(f'History last observation **{actual_date}** · reference price **{fmt_price(m["spot"])}** (option-history Close Price, not independently verified) · '
              f'GEX expirations **{len(g_live)}** · DEX **{len(x_live)}** · EM rows **{len(em_live)}** · flow rows **{len(f):,}** · unusual rows **{len(u):,}** · '
-             f'strike GEX **{"loaded" if gxs is not None else "missing"}** · option chain **{"loaded" if data.get("option_chain") is not None else "missing"}**')
+             f'strike GEX **{"loaded" if gxs is not None else "missing"}** · option chain **{("Yahoo " + chain_stamp) if chain_src=="Yahoo Finance" and chain_raw is not None else ("CSV" if chain_raw is not None else "missing")}**')
     fp=pd.to_numeric(f.get('Price~',pd.Series(dtype=float)),errors='coerce').dropna()
     if not fp.empty: st.write(f'Options-flow reference price: **{fmt_price(fp.iloc[-1])}** (print time not verified).')
     st.warning('GEX/DEX, flow, unusual, option-chain and strike-GEX files are single snapshots; the Analysis date cannot reconstruct their earlier states. Make sure every file was exported for the same session.')
@@ -874,11 +932,19 @@ with T4:
 # =====================================================================================
 with T5:
     st.caption('IV/HV → dealer gamma path → reachable body strike → quoted 1:-2:1 butterfly → expiration and early-exit scenarios. Quotes are snapshots, not executable prices.')
-    raw_chain=data.get('option_chain')
-    if raw_chain is None:
-        st.info('Upload an option-chain CSV (type, strike, expiration_date, bid, ask, implied_volatility; gamma and open_interest for GEX) to enable this tab.')
+    raw_chain=chain_raw
+    spot_b=chain_spot if chain_src=='Yahoo Finance' and pd.notna(chain_spot) else m['spot']
+    if chain_err:
+        st.error(f'Yahoo Finance option chain unavailable: {chain_err}')
+        st.caption('Switch the sidebar source to “Uploaded CSV” to use a file instead.')
+    elif raw_chain is None:
+        st.info('Upload an option-chain CSV (type, strike, expiration_date, bid, ask, implied_volatility; gamma and open_interest for GEX) or switch the sidebar source to Yahoo Finance.')
     else:
         try:
+            if chain_src=='Yahoo Finance':
+                dead=float(((raw_chain['bid']<=0)&(raw_chain['ask']<=0)).mean())
+                st.caption(f'Source: Yahoo Finance ({yh_symbol}) · spot {fmt_price(chain_spot)} · fetched {chain_stamp} · gamma computed with Black-Scholes from Yahoo IV (Yahoo provides no greeks) · open interest is prior-day.')
+                if dead>.4: st.warning(f'{dead:.0%} of contracts have no bid/ask (market closed or illiquid). Yahoo quotes and IV are unreliable then; re-check during market hours before relying on pricing or GEX.')
             chain=bfly_chain(raw_chain)
             dates=sorted(pd.Timestamp(d).date() for d in chain.expiry.dropna().unique() if pd.Timestamp(d).date()>=actual_date)
             if not dates: st.warning('No option-chain expirations after the analysis date.')
@@ -904,7 +970,7 @@ with T5:
                        ('Expiry net GEX',fmt_money(expiry_gex),'blue'),
                        ('Chain coverage',f'{len(q):,} contracts','gray',f'{days_left} DTE')])
                 e=em[(em.date.dt.date==exp)]
-                em_amount=float(e.iloc[0].expected_move_amt) if len(e) else float(m['spot']*(iv7pct/100)*np.sqrt(days_left/365)) if pd.notna(iv7pct) else np.nan
+                em_amount=float(e.iloc[0].expected_move_amt) if len(e) else float(spot_b*(iv7pct/100)*np.sqrt(days_left/365)) if pd.notna(iv7pct) else np.nan
 
                 notes=[]
                 if days_left<=1: notes.append('0–1DTE expected-move snapshots can be distorted; the distance/EM filter is disabled for this expiry.')
@@ -924,10 +990,10 @@ with T5:
                     st.caption('Path GEX is a static-exposure filter, not a simulated hedging response. Technical breakout confirmation is not in these CSVs.')
 
                 chain_strikes=sorted(set(q['strike'].to_numpy(float)))
-                possible=[k for k in chain_strikes if abs(k-m['spot'])<=max(2*em_amount if pd.notna(em_amount) else 150,60)]
-                expiry_profile=expiry_strike_gex(chain,pd.Timestamp(exp),m['spot'])
+                possible=[k for k in chain_strikes if abs(k-spot_b)<=max(2*em_amount if pd.notna(em_amount) else 150,60)]
+                expiry_profile=expiry_strike_gex(chain,pd.Timestamp(exp),spot_b)
                 if not expiry_profile.empty:
-                    all_profiles=[expiry_strike_gex(chain,d_,m['spot']) for d_ in chain.expiry.dropna().unique()]
+                    all_profiles=[expiry_strike_gex(chain,d_,spot_b) for d_ in chain.expiry.dropna().unique()]
                     all_profiles=[z for z in all_profiles if not z.empty]
                     aggregate_chain_net=sum(float(z.net_gex.sum()) for z in all_profiles) if all_profiles else np.nan
                     selected_chain_net=float(expiry_profile.net_gex.sum())
@@ -940,13 +1006,13 @@ with T5:
                                ('Selected / all gross',f'{dominance:.1%}' if pd.notna(dominance) else '—','gray'),
                                ('Sign comparison',agreement,'gray')])
                         st.caption('Both proxies come from the SAME chain snapshot (calls +, puts −), not verified dealer inventory; do not compare them with the separately uploaded GEX series.')
-                    view=expiry_profile[(expiry_profile.strike>=m['spot']-150)&(expiry_profile.strike<=m['spot']+150)].copy()
+                    view=expiry_profile[(expiry_profile.strike>=spot_b-150)&(expiry_profile.strike<=spot_b+150)].copy()
                     fig_g=go.Figure()
                     fig_g.add_bar(x=view.strike,y=view.net_gex/1e6,marker_color=np.where(view.net_gex>=0,'#16a34a','#dc2626'),name='Net GEX')
-                    fig_g.add_vline(x=m['spot'],line_dash='dash',annotation_text='Spot')
+                    fig_g.add_vline(x=spot_b,line_dash='dash',annotation_text='Spot')
                     if pd.notna(em_amount) and em_amount>0:
-                        fig_g.add_vline(x=m['spot']-em_amount,line_dash='dot',line_color='#eab308',annotation_text='EM low')
-                        fig_g.add_vline(x=m['spot']+em_amount,line_dash='dot',line_color='#eab308',annotation_text='EM high')
+                        fig_g.add_vline(x=spot_b-em_amount,line_dash='dot',line_color='#eab308',annotation_text='EM low')
+                        fig_g.add_vline(x=spot_b+em_amount,line_dash='dot',line_color='#eab308',annotation_text='EM high')
                     fig_g.update_layout(height=360,title=f'GEX by strike — {exp:%b %d} (estimated OI × gamma)',xaxis_title='Strike',yaxis_title='$M / 1% move',bargap=.15,margin=dict(t=50,b=10))
                     st.plotly_chart(fig_g,use_container_width=True)
                     cand_prof=view[view.strike.isin(possible)]; cand_prof=cand_prof[cand_prof.net_gex>0].nlargest(12,'net_gex')
@@ -963,7 +1029,7 @@ with T5:
                 modes=[]
                 if direction!='Bullish call BWB':modes.append('PUT')
                 if direction!='Bearish put BWB':modes.append('CALL')
-                parts=[bfly_candidates(chain,pd.Timestamp(exp),m['spot'],t_,targets,em_amount,expiry_profile,wing_choice,max_debit,max_spread,min_oi,True) for t_ in modes]
+                parts=[bfly_candidates(chain,pd.Timestamp(exp),spot_b,t_,targets,em_amount,expiry_profile,wing_choice,max_debit,max_spread,min_oi,True) for t_ in modes]
                 parts=[p for p in parts if not p.empty]
                 result=pd.concat(parts,ignore_index=True) if parts else pd.DataFrame()
                 if not result.empty:
@@ -996,9 +1062,9 @@ with T5:
                                      format_func=lambda i:f"{result.iloc[i]['Direction']} | {result.iloc[i]['Long Lower']:,.0f} / {result.iloc[i]['Short Body']:,.0f} / {result.iloc[i]['Long Upper']:,.0f} | ${result.iloc[i]['Natural Debit $']:,.0f}")
                     row=result.iloc[idx];typ=row['Type'];kl=row['Long Lower'];kb=row['Short Body'];kh=row['Long Upper'];debit=row['Natural Debit $']/100
                     pad=max(20,(em_amount if pd.notna(em_amount) else 50)*.4)
-                    grid=np.linspace(min(kl,m['spot'])-pad,max(kh,m['spot'])+pad,251)
+                    grid=np.linspace(min(kl,spot_b)-pad,max(kh,spot_b)+pad,251)
                     fig=go.Figure(go.Scatter(x=grid,y=bfly_payoff(grid,typ,kl,kb,kh,debit),name='Expiration P/L'))
-                    fig.add_hline(y=0,line_dash='dash');fig.add_vline(x=m['spot'],line_dash='dot',annotation_text='Spot');fig.add_vline(x=kb,line_dash='dot',annotation_text='Body')
+                    fig.add_hline(y=0,line_dash='dash');fig.add_vline(x=spot_b,line_dash='dot',annotation_text='Spot');fig.add_vline(x=kb,line_dash='dot',annotation_text='Body')
                     fig.update_layout(height=340,title='Expiration P/L (natural-entry debit)',xaxis_title='Price at expiry',yaxis_title='P/L ($)',margin=dict(t=50,b=10))
                     st.plotly_chart(fig,use_container_width=True)
 
@@ -1011,7 +1077,7 @@ with T5:
                         values=[bfly_black_scholes(grid,k,rem_t,max(v+iv_shift/100,.0001),typ,annual_rate) for k,v in zip((kl,kb,kh),row['Leg IVs'])]
                         model_pnl=(values[0]-2*values[1]+values[2]-debit)*100
                         fig2=go.Figure(go.Scatter(x=grid,y=model_pnl,name='Model exit P/L'))
-                        fig2.add_hline(y=0,line_dash='dash');fig2.add_vline(x=m['spot'],line_dash='dot',annotation_text='Spot');fig2.add_vline(x=kb,line_dash='dot',annotation_text='Body')
+                        fig2.add_hline(y=0,line_dash='dash');fig2.add_vline(x=spot_b,line_dash='dot',annotation_text='Spot');fig2.add_vline(x=kb,line_dash='dot',annotation_text='Body')
                         fig2.update_layout(height=340,title=f'Modeled P/L after {exit_days} trading days · IV {iv_shift:+.1f} pts',xaxis_title='Price at exit',yaxis_title='P/L ($)',margin=dict(t=50,b=10))
                         st.plotly_chart(fig2,use_container_width=True)
                         st.caption('Per-leg snapshot IV (parallel shift only), Black–Scholes European pricing, approximate trading→calendar day conversion. Excludes slippage, fees, skew changes and evolving GEX.')
