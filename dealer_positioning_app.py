@@ -987,7 +987,17 @@ with T8:
             dates=sorted(pd.Timestamp(d).date() for d in chain.expiry.dropna().unique() if pd.Timestamp(d).date()>=actual_date)
             if not dates: st.warning('No option-chain expirations after the analysis date.')
             else:
-                exp=st.selectbox('Butterfly expiration',dates,key='bwb_exp')
+                # Single source of truth: the Command Center's Expected move to selector.
+                # The chart, option-chain proxy, BWB candidates and expiration metrics
+                # now all follow that selection. A fallback is needed when the uploaded
+                # chain does not contain the selected expected-move expiration.
+                if em_dates and em_pick in dates:
+                    exp=em_pick
+                    st.success(f'GEX chart and BWB lab linked to Expected move to: {exp:%b %d, %Y} ({(exp-actual_date).days} DTE)')
+                else:
+                    exp=st.selectbox('Butterfly expiration (chain fallback)',dates,key='bwb_exp',
+                                    help='The Expected move to expiration is absent from this uploaded option chain. This fallback is not synchronized.')
+                    st.warning('Selected Expected move to expiration is not in the uploaded option chain. Showing the explicitly selected fallback expiration.')
                 days_left=(exp-actual_date).days
                 q=chain[chain.expiry==pd.Timestamp(exp)]
                 close=pd.to_numeric(h_view['Close Price'],errors='coerce').dropna()
@@ -1035,12 +1045,31 @@ with T8:
                 # Expiry-specific exposure drives body selection; pricing only selects wings.
                 expiry_profile=expiry_strike_gex(chain,pd.Timestamp(exp),m['spot'])
                 if not expiry_profile.empty:
+                    # Compare like-for-like proxy exposures: all-expiry chain vs
+                    # selected-expiry chain. Never label these verified dealer positions.
+                    all_profiles=[expiry_strike_gex(chain, d, m['spot']) for d in chain.expiry.dropna().unique()]
+                    all_profiles=[z for z in all_profiles if not z.empty]
+                    aggregate_chain_net=sum(float(z.net_gex.sum()) for z in all_profiles) if all_profiles else np.nan
+                    selected_chain_net=float(expiry_profile.net_gex.sum())
+                    gross_all=sum(float(z.net_gex.abs().sum()) for z in all_profiles) if all_profiles else np.nan
+                    dominance=abs(selected_chain_net)/gross_all if pd.notna(gross_all) and gross_all>0 else np.nan
+                    if pd.notna(aggregate_chain_net):
+                        agreement='Same sign' if np.sign(selected_chain_net)==np.sign(aggregate_chain_net) else 'Opposite signs'
+                        g1,g2,g3,g4=st.columns(4)
+                        g1.metric('All-chain net GEX proxy',fmt_money(aggregate_chain_net))
+                        g2.metric(f'{days_left}DTE net GEX proxy',fmt_money(selected_chain_net))
+                        g3.metric('Selected / all gross',f'{dominance:.1%}' if pd.notna(dominance) else '—')
+                        g4.metric('Regime sign comparison',agreement)
+                        st.caption('Both metrics are recalculated from the SAME uploaded option-chain snapshot and identical call-positive / put-negative assumptions. They are not verified dealer inventory. All-chain means expirations present in the upload, not necessarily every listed SPX expiry. Do not compare these dollar values directly with the separately uploaded aggregate GEX series.')
                     view=expiry_profile[(expiry_profile.strike>=m['spot']-150)&(expiry_profile.strike<=m['spot']+150)].copy()
                     st.markdown('#### GEX by strike — selected expiration')
-                    st.caption('Estimated OI × gamma exposure from uploaded option chain; calls assumed positive and puts negative. This is a proxy, not verified dealer inventory. Aggregate strike GEX is NOT used as 0DTE GEX.')
+                    st.caption(f'Expiration: {exp:%b %d, %Y} ({days_left} DTE), linked to Expected move to when chain coverage permits. Estimated OI × gamma from the uploaded chain; calls assumed positive and puts negative. This is not verified dealer inventory. Yellow lines are the selected expiration expected-move bounds.')
                     fig_g=go.Figure()
                     fig_g.add_bar(x=view.strike,y=view.net_gex/1e6,marker_color=np.where(view.net_gex>=0,'#16a34a','#dc2626'),name='Net GEX')
                     fig_g.add_vline(x=m['spot'],line_dash='dash',annotation_text='Spot')
+                    if pd.notna(em_amount) and em_amount>0:
+                        fig_g.add_vline(x=m['spot']-em_amount,line_dash='dot',line_color='#eab308',annotation_text='EM low')
+                        fig_g.add_vline(x=m['spot']+em_amount,line_dash='dot',line_color='#eab308',annotation_text='EM high')
                     fig_g.update_layout(height=400,xaxis_title='SPX strike',yaxis_title='Estimated $M / 1% move',bargap=.15)
                     st.plotly_chart(fig_g,use_container_width=True)
                     candidate_profile=view[view.strike.isin(possible)].copy()
